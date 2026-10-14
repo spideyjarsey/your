@@ -89,7 +89,7 @@ export const BulkFolderImportModal: React.FC<BulkFolderImportModalProps> = ({
   const [localUploadProgress, setLocalUploadProgress] = useState({ current: 0, total: 0 });
 
   // Batch Configuration form
-  const [batchCategory, setBatchCategory] = useState<string>(() => categories[0]?.id || 'EDC');
+  const [batchCategory, setBatchCategory] = useState<string>(() => categories[0]?.id || categories[0]?.name || '');
   const [customCategory, setCustomCategory] = useState<string>('');
   // Product Title / Name Configuration (User requested: product title/name that displays under each jersey)
   const [commonTitle, setCommonTitle] = useState<string>('');
@@ -98,9 +98,7 @@ export const BulkFolderImportModal: React.FC<BulkFolderImportModalProps> = ({
   const [titlePrefix, setTitlePrefix] = useState<string>('');
 
   // Optional Product Description / Details state
-  const [sharedCaption, setSharedCaption] = useState<string>(
-    '2025/26 Premium Authentic Player Edition Jersey crafted with ultralight aeroready moisture-wicking matrix, heat-bonded silicone crest, and laser-cut ventilation zones.'
-  );
+  const [sharedCaption, setSharedCaption] = useState<string>('');
   const [captionMode, setCaptionMode] = useState<'common' | 'individual'>('common');
   const [showCaptionPreview, setShowCaptionPreview] = useState<boolean>(false);
   const [showDescriptionSection, setShowDescriptionSection] = useState<boolean>(false);

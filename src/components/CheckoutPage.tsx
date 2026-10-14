@@ -592,12 +592,18 @@ export const CheckoutPage: React.FC<CheckoutPageProps> = ({
                           className="p-3 rounded-2xl bg-neutral-50 border border-neutral-200/80 text-xs space-y-2.5 transition-all"
                         >
                           <div className="flex items-start gap-3">
-                            <img
-                              src={item.product?.images?.[0] || 'https://images.unsplash.com/photo-1577212017184-80cc0da11082?auto=format&fit=crop&w=150&q=80'}
-                              alt={item.product?.title}
-                              referrerPolicy="no-referrer"
-                              className="w-14 h-14 rounded-lg object-contain bg-white border border-neutral-200 shrink-0 p-0.5"
-                            />
+                            {item.product?.images && item.product.images[0] ? (
+                              <img
+                                src={item.product.images[0]}
+                                alt={item.product?.title}
+                                referrerPolicy="no-referrer"
+                                className="w-14 h-14 rounded-lg object-contain bg-white border border-neutral-200 shrink-0 p-0.5"
+                              />
+                            ) : (
+                              <div className="w-14 h-14 rounded-lg bg-white border border-neutral-200 shrink-0 flex items-center justify-center text-[9px] text-neutral-400 font-bold">
+                                ITEM
+                              </div>
+                            )}
 
                             <div className="flex-1 min-w-0">
                               <h4 className="font-extrabold text-neutral-900 truncate">

@@ -74,25 +74,17 @@ function loadJsonFile<T>(filePath: string, defaultValue: T): T {
 
 // Helper to atomically save JSON with automatic backup rotation
 function saveJsonFile(filePath: string, data: any) {
-  // Strict Safeguard: Block saving empty products or categories over existing files
-  if (filePath === PRODUCTS_FILE || filePath === CATEGORIES_FILE) {
-    if (!Array.isArray(data) || data.length === 0) {
-      console.warn(`Blocked attempt to write empty array to ${filePath}`);
-      return;
-    }
-  }
-
   const backupPath = `${filePath}.bak`;
   const tempPath = `${filePath}.tmp.${Date.now()}`;
   try {
     const jsonString = JSON.stringify(data, null, 2);
     // 1. Write to temp file first
     fs.writeFileSync(tempPath, jsonString, 'utf-8');
-    // 2. Rotate current file to backup ONLY if it has meaningful content
+    // 2. Rotate current file to backup ONLY if it has content
     if (fs.existsSync(filePath)) {
       try {
         const stat = fs.statSync(filePath);
-        if (stat.size > 10) {
+        if (stat.size > 0) {
           fs.copyFileSync(filePath, backupPath);
         }
       } catch {}
@@ -119,9 +111,9 @@ interface StoredImage {
   uploadedAt: string;
 }
 
-// Initialize persistent state - Protects existing data against overwrite on deployment
+// Initialize persistent state - Protects existing user data
 let deletedProductIds: string[] = loadJsonFile<string[]>(DELETED_PRODUCTS_FILE, []);
-let products: JerseyProduct[] = loadJsonFile<JerseyProduct[]>(PRODUCTS_FILE, [...INITIAL_JERSEYS]);
+let products: JerseyProduct[] = loadJsonFile<JerseyProduct[]>(PRODUCTS_FILE, []);
 
 // Purge any products that were permanently deleted
 if (deletedProductIds.length > 0) {
@@ -142,15 +134,8 @@ products.forEach((p, idx) => {
 
 let orders: Order[] = loadJsonFile<Order[]>(ORDERS_FILE, []);
 let siteSettings: SiteSettings = loadJsonFile<SiteSettings>(SETTINGS_FILE, { ...DEFAULT_SITE_SETTINGS });
-let categoryItems: CategoryItem[] = loadJsonFile<CategoryItem[]>(CATEGORIES_FILE, [...CATEGORY_CAROUSEL_ITEMS]);
-if (!Array.isArray(categoryItems) || categoryItems.length === 0) {
-  categoryItems = [...CATEGORY_CAROUSEL_ITEMS];
-  saveJsonFile(CATEGORIES_FILE, categoryItems);
-}
-if (!Array.isArray(products) || products.length === 0) {
-  products = [...INITIAL_JERSEYS];
-  saveJsonFile(PRODUCTS_FILE, products);
-}
+let categoryItems: CategoryItem[] = loadJsonFile<CategoryItem[]>(CATEGORIES_FILE, []);
+
 let deletedCategoryIds: string[] = loadJsonFile<string[]>(DELETED_CATEGORIES_FILE, []);
 if (deletedCategoryIds.length > 0) {
   const delSet = new Set(deletedCategoryIds);
@@ -323,23 +308,58 @@ async function startServer() {
   });
 
   // --- Site Settings (Hero Banner, Slogans, Logos) ---
-  app.get('/api/settings', (req: Request, res: Response) => {
+  app.get('/api/settings', (_req: Request, res: Response) => {
+    res.set('Cache-Control', 'no-store, no-cache, must-revalidate, proxy-revalidate');
+    res.set('Pragma', 'no-cache');
+    res.set('Expires', '0');
+    if (fs.existsSync(SETTINGS_FILE)) {
+      const loaded = loadJsonFile<SiteSettings>(SETTINGS_FILE, { ...DEFAULT_SITE_SETTINGS });
+      if (loaded && typeof loaded === 'object') {
+        siteSettings = { ...DEFAULT_SITE_SETTINGS, ...loaded };
+      }
+    }
     res.json({ success: true, settings: siteSettings });
   });
 
   app.post('/api/settings', (req: Request, res: Response) => {
+    const body = req.body || {};
+    let finalHeroBg = body.heroBgImage !== undefined ? body.heroBgImage : siteSettings.heroBgImage;
+    if (typeof finalHeroBg === 'string' && finalHeroBg.startsWith('data:image/')) {
+      finalHeroBg = sanitizeCategoryImage(finalHeroBg, 'hero_banner');
+    }
+
+    let finalLogo = body.headerLogoImage !== undefined ? body.headerLogoImage : siteSettings.headerLogoImage;
+    if (typeof finalLogo === 'string' && finalLogo.startsWith('data:image/')) {
+      finalLogo = sanitizeCategoryImage(finalLogo, 'header_logo');
+    }
+
     siteSettings = {
       ...siteSettings,
-      ...req.body
+      ...body,
+      heroBgImage: finalHeroBg,
+      headerLogoImage: finalLogo
     };
     saveJsonFile(SETTINGS_FILE, siteSettings);
     res.json({ success: true, settings: siteSettings });
   });
 
   app.put('/api/settings', (req: Request, res: Response) => {
+    const body = req.body || {};
+    let finalHeroBg = body.heroBgImage !== undefined ? body.heroBgImage : siteSettings.heroBgImage;
+    if (typeof finalHeroBg === 'string' && finalHeroBg.startsWith('data:image/')) {
+      finalHeroBg = sanitizeCategoryImage(finalHeroBg, 'hero_banner');
+    }
+
+    let finalLogo = body.headerLogoImage !== undefined ? body.headerLogoImage : siteSettings.headerLogoImage;
+    if (typeof finalLogo === 'string' && finalLogo.startsWith('data:image/')) {
+      finalLogo = sanitizeCategoryImage(finalLogo, 'header_logo');
+    }
+
     siteSettings = {
       ...siteSettings,
-      ...req.body
+      ...body,
+      heroBgImage: finalHeroBg,
+      headerLogoImage: finalLogo
     };
     saveJsonFile(SETTINGS_FILE, siteSettings);
     res.json({ success: true, settings: siteSettings });
@@ -407,15 +427,9 @@ async function startServer() {
     // Always ensure in-memory state matches disk state
     if (fs.existsSync(CATEGORIES_FILE)) {
       const loaded = loadJsonFile<CategoryItem[]>(CATEGORIES_FILE, []);
-      if (Array.isArray(loaded) && loaded.length > 0) {
+      if (Array.isArray(loaded)) {
         categoryItems = loaded;
       }
-    }
-
-    // Fail-safe: If categories is empty, recover from initial catalog
-    if (!Array.isArray(categoryItems) || categoryItems.length === 0) {
-      categoryItems = [...CATEGORY_CAROUSEL_ITEMS];
-      saveJsonFile(CATEGORIES_FILE, categoryItems);
     }
 
     // Stamp sortOrder and position if missing
@@ -804,15 +818,9 @@ async function startServer() {
     // Always ensure in-memory state matches disk state
     if (fs.existsSync(PRODUCTS_FILE)) {
       const loaded = loadJsonFile<JerseyProduct[]>(PRODUCTS_FILE, []);
-      if (Array.isArray(loaded) && loaded.length > 0) {
+      if (Array.isArray(loaded)) {
         products = loaded;
       }
-    }
-
-    // Fail-safe: If products is empty, recover from initial catalog
-    if (!Array.isArray(products) || products.length === 0) {
-      products = [...INITIAL_JERSEYS];
-      saveJsonFile(PRODUCTS_FILE, products);
     }
 
     // Ensure sortOrder and position are stamped
@@ -899,12 +907,29 @@ async function startServer() {
 
   // Create Product (Admin)
   app.post('/api/products', (req: Request, res: Response) => {
+    // Reload from disk first
+    if (fs.existsSync(PRODUCTS_FILE)) {
+      const loaded = loadJsonFile<JerseyProduct[]>(PRODUCTS_FILE, []);
+      if (Array.isArray(loaded)) {
+        products = loaded;
+      }
+    }
+
     const data = req.body;
     if (!data.title || !data.category || data.price === undefined) {
       return res.status(400).json({ success: false, message: 'Title, category, and price are required' });
     }
 
     const autoCode = data.code || `SJ-${Math.random().toString(36).substring(2, 7).toUpperCase()}`;
+
+    const sanitizedImages = (Array.isArray(data.images) ? data.images : [])
+      .map((img: any) => {
+        if (typeof img === 'string' && img.startsWith('data:image/')) {
+          return sanitizeCategoryImage(img, data.title || 'prod');
+        }
+        return typeof img === 'string' ? img.trim() : '';
+      })
+      .filter((img: string) => Boolean(img) && !img.startsWith('blob:'));
 
     const newProduct: JerseyProduct = {
       id: `spidey-${Date.now()}-${Math.random().toString(36).substring(2, 6)}`,
@@ -916,20 +941,14 @@ async function startServer() {
       season: data.season || '2024/25',
       edition: data.edition || 'Player Issue / Authentic',
       badge: data.badge || undefined,
-      images: Array.isArray(data.images) && data.images.length > 0 ? data.images : [
-        'https://images.unsplash.com/photo-1577212017184-80cc0da11082?auto=format&fit=crop&w=1000&q=80'
-      ],
-      description: data.description || 'Premium engineered sports jersey crafted with breathable fabric matrix.',
-      features: Array.isArray(data.features) && data.features.length > 0 ? data.features : [
-        'Advanced aerodynamic breathability weave',
-        'High-definition thermal-bonded team emblem',
-        'Tailored athletic performance fit'
-      ],
+      images: sanitizedImages,
+      description: data.description || '',
+      features: Array.isArray(data.features) ? data.features : [],
       sizes: Array.isArray(data.sizes) && data.sizes.length > 0 ? data.sizes : ['S', 'M', 'L', 'XL', 'XXL', '3XL'],
       inStock: data.inStock !== false,
       stockCount: data.stockCount !== undefined ? Number(data.stockCount) : 15,
       rating: 5.0,
-      reviewCount: 1,
+      reviewCount: 0,
       customizable: data.customizable !== false,
       colorTheme: data.colorTheme || {
         primary: '#111827',
@@ -1019,6 +1038,14 @@ async function startServer() {
 
   // Update Product (Admin)
   app.put('/api/products/:id', (req: Request, res: Response) => {
+    // Reload from disk first
+    if (fs.existsSync(PRODUCTS_FILE)) {
+      const loaded = loadJsonFile<JerseyProduct[]>(PRODUCTS_FILE, []);
+      if (Array.isArray(loaded)) {
+        products = loaded;
+      }
+    }
+
     const targetId = decodeURIComponent(String(req.params.id || '').trim());
     const index = products.findIndex((p) => p.id === targetId || p.code === targetId);
     if (index === -1) {
@@ -1028,11 +1055,24 @@ async function startServer() {
     const current = products[index];
     const updateData = req.body;
 
+    let sanitizedImages = current.images;
+    if (Array.isArray(updateData.images)) {
+      sanitizedImages = updateData.images
+        .map((img: any) => {
+          if (typeof img === 'string' && img.startsWith('data:image/')) {
+            return sanitizeCategoryImage(img, updateData.title || current.title || 'prod');
+          }
+          return typeof img === 'string' ? img.trim() : '';
+        })
+        .filter((img: string) => Boolean(img) && !img.startsWith('blob:'));
+    }
+
     const updated: JerseyProduct = {
       ...current,
       ...updateData,
       id: current.id,
       code: updateData.code !== undefined ? updateData.code : current.code,
+      images: sanitizedImages,
       price: updateData.price !== undefined ? Number(updateData.price) : current.price,
       originalPrice: updateData.originalPrice !== undefined ? (updateData.originalPrice ? Number(updateData.originalPrice) : undefined) : current.originalPrice,
       stockCount: updateData.stockCount !== undefined ? Number(updateData.stockCount) : current.stockCount,
@@ -1801,21 +1841,11 @@ async function startServer() {
   // Reconnect & Force Re-Index Store Data: POST /api/sync/reconnect or /api/sync/resync
   const handleResync = (_req: Request, res: Response) => {
     // 1. Re-read master files
-    const loadedProducts = loadJsonFile<JerseyProduct[]>(PRODUCTS_FILE, [...INITIAL_JERSEYS]);
-    if (Array.isArray(loadedProducts) && loadedProducts.length > 0) {
-      products = loadedProducts;
-    } else {
-      products = [...INITIAL_JERSEYS];
-      saveJsonFile(PRODUCTS_FILE, products);
-    }
+    const loadedProducts = loadJsonFile<JerseyProduct[]>(PRODUCTS_FILE, []);
+    products = Array.isArray(loadedProducts) ? loadedProducts : [];
 
-    const loadedCategories = loadJsonFile<CategoryItem[]>(CATEGORIES_FILE, [...CATEGORY_CAROUSEL_ITEMS]);
-    if (Array.isArray(loadedCategories) && loadedCategories.length > 0) {
-      categoryItems = loadedCategories;
-    } else {
-      categoryItems = [...CATEGORY_CAROUSEL_ITEMS];
-      saveJsonFile(CATEGORIES_FILE, categoryItems);
-    }
+    const loadedCategories = loadJsonFile<CategoryItem[]>(CATEGORIES_FILE, []);
+    categoryItems = Array.isArray(loadedCategories) ? loadedCategories : [];
 
     siteSettings = loadJsonFile<SiteSettings>(SETTINGS_FILE, { ...DEFAULT_SITE_SETTINGS });
     orders = loadJsonFile<Order[]>(ORDERS_FILE, []);

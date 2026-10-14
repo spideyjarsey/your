@@ -636,9 +636,9 @@ Amount: ${amountDisplay}${exchangeLine}${giftBoxLine}`;
                     <div className="flex items-start gap-3">
                       {/* Thumbnail Box */}
                       <div className="w-16 h-16 rounded-2xl bg-neutral-50 border border-neutral-200/80 p-1.5 shrink-0 overflow-hidden flex items-center justify-center">
-                        {item.product ? (
+                        {item.product?.images && item.product.images[0] ? (
                           <img 
-                            src={item.product.images?.[0] || 'https://images.unsplash.com/photo-1577212017184-80cc0da11082?auto=format&fit=crop&w=300&q=80'} 
+                            src={item.product.images[0]} 
                             alt={item.product.title}
                             referrerPolicy="no-referrer"
                             className="w-full h-full object-contain"
@@ -701,13 +701,19 @@ Amount: ${amountDisplay}${exchangeLine}${giftBoxLine}`;
                                     >
                                       {/* Left: Enlarged Product Thumbnail Image */}
                                       <div className="w-14 h-14 sm:w-15 sm:h-15 rounded-xl bg-neutral-50 p-1 border border-neutral-200/90 shadow-xs shrink-0 overflow-hidden flex items-center justify-center group-hover:border-neutral-300 transition-colors">
-                                        <img 
-                                          src={prod.images?.[0] || 'https://images.unsplash.com/photo-1577212017184-80cc0da11082?auto=format&fit=crop&w=300&q=80'} 
-                                          alt={prod.title}
-                                          referrerPolicy="no-referrer"
-                                          className="w-full h-full object-contain transition-transform duration-200 group-hover:scale-105"
-                                          loading="lazy"
-                                        />
+                                        {prod.images && prod.images[0] ? (
+                                          <img 
+                                            src={prod.images[0]} 
+                                            alt={prod.title}
+                                            referrerPolicy="no-referrer"
+                                            className="w-full h-full object-contain transition-transform duration-200 group-hover:scale-105"
+                                            loading="lazy"
+                                          />
+                                        ) : (
+                                          <div className="w-full h-full flex items-center justify-center text-[10px] text-neutral-400 font-bold">
+                                            ITEM
+                                          </div>
+                                        )}
                                       </div>
 
                                       {/* Right: Stacked Layout (Top: Code, Bottom: Title) */}

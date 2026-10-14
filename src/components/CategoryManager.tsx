@@ -568,8 +568,7 @@ export const CategoryManager: React.FC<CategoryManagerProps> = ({
                         alt={cat.name}
                         referrerPolicy="no-referrer"
                         onError={(e) => {
-                          (e.currentTarget as HTMLImageElement).src =
-                            'https://images.unsplash.com/photo-1577212017184-80cc0da11082?auto=format&fit=crop&w=400&q=80';
+                          (e.currentTarget as HTMLImageElement).style.display = 'none';
                         }}
                         className="w-full h-full object-cover rounded-xl"
                       />
@@ -736,8 +735,7 @@ export const CategoryManager: React.FC<CategoryManagerProps> = ({
                         alt="Category Preview"
                         referrerPolicy="no-referrer"
                         onError={(e) => {
-                          (e.currentTarget as HTMLImageElement).src =
-                            'https://images.unsplash.com/photo-1577212017184-80cc0da11082?auto=format&fit=crop&w=400&q=80';
+                          (e.currentTarget as HTMLImageElement).style.display = 'none';
                         }}
                         className="w-full h-full object-cover"
                       />

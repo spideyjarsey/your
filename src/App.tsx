@@ -1,5 +1,5 @@
 import React, { useState, useEffect, useMemo } from 'react';
-import { Search, Heart, ShieldCheck, Check, ArrowUp, Key, Download, Lock, KeyRound, Smartphone, Eye, EyeOff, Sparkles, ArrowRight, AlertCircle, X } from 'lucide-react';
+import { Search, Heart, ShieldCheck, Check, ArrowUp, Key, Download, Lock, KeyRound, Smartphone, Eye, EyeOff, Sparkles, ArrowRight, AlertCircle, X, Package } from 'lucide-react';
 import { Navbar } from './components/Navbar';
 import { HeroBanner } from './components/HeroBanner';
 import { CategoryFilter } from './components/CategoryFilter';
@@ -231,7 +231,7 @@ export default function App() {
       const saved = localStorage.getItem('spidey_categories');
       if (saved) {
         const parsed = JSON.parse(saved);
-        if (Array.isArray(parsed) && parsed.length > 0) {
+        if (Array.isArray(parsed)) {
           return parsed.sort((a: any, b: any) => {
             const orderA = typeof a.sortOrder === 'number' ? a.sortOrder : (typeof a.position === 'number' ? a.position : 0);
             const orderB = typeof b.sortOrder === 'number' ? b.sortOrder : (typeof b.position === 'number' ? b.position : 0);
@@ -239,9 +239,9 @@ export default function App() {
           });
         }
       }
-      return [...CATEGORY_CAROUSEL_ITEMS];
+      return [];
     } catch {
-      return [...CATEGORY_CAROUSEL_ITEMS];
+      return [];
     }
   });
 
@@ -275,7 +275,7 @@ export default function App() {
       const deletedIds: string[] = deletedRaw ? JSON.parse(deletedRaw) : [];
       const delSet = new Set(deletedIds.filter(id => Boolean(id && String(id).trim())));
 
-      const saved = localStorage.getItem('spidey_products') || localStorage.getItem('orifake_products');
+      const saved = localStorage.getItem('spidey_products');
       if (saved) {
         const parsed = JSON.parse(saved);
         if (Array.isArray(parsed) && parsed.length > 0) {
@@ -285,12 +285,9 @@ export default function App() {
           }
         }
       }
-      const initialClean = INITIAL_JERSEYS
-        .filter((p) => !(p.id && delSet.has(p.id)) && !(p.code && delSet.has(p.code)))
-        .map((p, idx) => ({ ...p, sortOrder: idx, position: idx }));
-      return sortProductsWithPinned(initialClean.length > 0 ? initialClean : INITIAL_JERSEYS);
+      return [];
     } catch {
-      return INITIAL_JERSEYS.map((p, idx) => ({ ...p, sortOrder: idx, position: idx }));
+      return [];
     }
   });
 
@@ -538,13 +535,14 @@ export default function App() {
             localStorage.removeItem('orifake_products');
           } catch {}
         } else {
-          // If server products came back empty, ensure we never show blank store
-          setProducts((prev) => (prev && prev.length > 0 ? prev : sortProductsWithPinned(INITIAL_JERSEYS)));
+          setProducts([]);
+          try {
+            localStorage.setItem('spidey_products', JSON.stringify([]));
+          } catch {}
         }
       }
     } catch (err) {
-      console.warn('Using local/cached dataset:', err);
-      setProducts((prev) => (prev && prev.length > 0 ? prev : sortProductsWithPinned(INITIAL_JERSEYS)));
+      console.warn('Products fetch error:', err);
     }
   };
 
@@ -599,13 +597,14 @@ export default function App() {
             localStorage.removeItem('spidey_deleted_category_ids');
           } catch {}
         } else {
-          // If server categories was empty, fall back to default carousel items
-          setCategoryItems((prev) => (prev && prev.length > 0 ? prev : CATEGORY_CAROUSEL_ITEMS));
+          setCategoryItems([]);
+          try {
+            localStorage.setItem('spidey_categories', JSON.stringify([]));
+          } catch {}
         }
       }
     } catch (err) {
       console.warn('Categories fetch error:', err);
-      setCategoryItems((prev) => (prev && prev.length > 0 ? prev : CATEGORY_CAROUSEL_ITEMS));
     }
   };
 
@@ -1424,7 +1423,24 @@ export default function App() {
               </div>
 
               {/* Strict 2-Column Grid on Mobile, 3-4 on Desktop */}
-              {displayedProducts.length === 0 ? (
+              {safeProductsList.length === 0 ? (
+                <div className="bg-[#f6f7f9] rounded-3xl p-10 text-center space-y-4 max-w-md mx-auto my-8">
+                  <Package className="w-10 h-10 text-neutral-400 mx-auto" />
+                  <h3 className="text-base font-bold text-neutral-900">ক্যাটালগ পরিষ্কার রয়েছে</h3>
+                  <p className="text-xs text-neutral-500">
+                    এখনও কোনো প্রোডাক্ট যোগ করা হয়নি। আপনি অ্যাডমিন প্যানেল থেকে আপনার নিজস্ব প্রোডাক্ট ও ছবি আপলোড করতে পারেন।
+                  </p>
+                  <button
+                    onClick={() => {
+                      setCurrentView('admin');
+                      window.history.pushState({}, '', '/admin');
+                    }}
+                    className="px-5 py-2.5 rounded-full bg-neutral-900 text-white font-bold text-xs shadow-md hover:bg-neutral-800 transition-all cursor-pointer"
+                  >
+                    অ্যাডমিন প্যানেলে যান
+                  </button>
+                </div>
+              ) : displayedProducts.length === 0 ? (
                 <div className="bg-[#f6f7f9] rounded-3xl p-10 text-center space-y-4 max-w-md mx-auto my-8">
                   <Search className="w-8 h-8 text-neutral-400 mx-auto" />
                   <h3 className="text-base font-bold text-neutral-900">No Matching Items</h3>

@@ -323,23 +323,19 @@ export const AdminPanel: React.FC<AdminPanelProps> = ({
   // Product Form Fields
   const [formCode, setFormCode] = useState('');
   const [formTitle, setFormTitle] = useState('');
-  const [formCategory, setFormCategory] = useState('EDC');
+  const [formCategory, setFormCategory] = useState(() => categories[0]?.id || categories[0]?.name || '');
   const [formCustomCategory, setFormCustomCategory] = useState('');
-  const [formPrice, setFormPrice] = useState('129.99');
-  const [formOriginalPrice, setFormOriginalPrice] = useState('159.99');
-  const [formSeason, setFormSeason] = useState('2025');
-  const [formEdition, setFormEdition] = useState('Pro Edition / Titanium');
-  const [formBadge, setFormBadge] = useState('New Drop');
+  const [formPrice, setFormPrice] = useState('');
+  const [formOriginalPrice, setFormOriginalPrice] = useState('');
+  const [formSeason, setFormSeason] = useState('');
+  const [formEdition, setFormEdition] = useState('');
+  const [formBadge, setFormBadge] = useState('');
   const [formDescription, setFormDescription] = useState('');
-  const [formStockCount, setFormStockCount] = useState('25');
+  const [formStockCount, setFormStockCount] = useState('20');
   const [formInStock, setFormInStock] = useState(true);
   const [formSizes, setFormSizes] = useState<string[]>(['S', 'M', 'L', 'XL', 'XXL', '3XL']);
   const [formImages, setFormImages] = useState<string[]>([]);
-  const [formFeatures, setFormFeatures] = useState<string[]>([
-    'CNC milled grade-5 titanium frame',
-    'Drop-tested anti-impact honeycomb core',
-    'MagSafe magnetic neodymium array'
-  ]);
+  const [formFeatures, setFormFeatures] = useState<string[]>([]);
   const [featureInput, setFeatureInput] = useState('');
 
   // Uploading states
@@ -384,23 +380,19 @@ export const AdminPanel: React.FC<AdminPanelProps> = ({
     setEditingProduct(null);
     setFormCode(generateRandomCode());
     setFormTitle('');
-    setFormCategory(categories[0]?.id || 'EDC');
+    setFormCategory(categories[0]?.id || categories[0]?.name || '');
     setFormCustomCategory('');
-    setFormPrice('1150');
-    setFormOriginalPrice('1350');
-    setFormSeason('2025');
-    setFormEdition('Pro Edition / Titanium');
-    setFormBadge('New Drop');
-    setFormDescription('Authentic club matchwear jersey with moisture-wicking Dri-FIT fabric and heat-pressed club crest.');
+    setFormPrice('');
+    setFormOriginalPrice('');
+    setFormSeason('');
+    setFormEdition('');
+    setFormBadge('');
+    setFormDescription('');
     setFormStockCount('20');
     setFormInStock(true);
     setFormSizes(['S', 'M', 'L', 'XL', 'XXL', '3XL']);
-    setFormImages(['/images/prod_pixel_case_1787668274006.jpg']);
-    setFormFeatures([
-      'Moisture-wicking breathable ventilation matrix',
-      'Authentic heat-pressed club emblem',
-      'Athletic ergonomic seam construction'
-    ]);
+    setFormImages([]);
+    setFormFeatures([]);
     setFormCustomizationChargeType(localSettings.defaultCustomizationChargeType || 'free');
     setFormCustomizationCharge(String(localSettings.defaultCustomizationCharge || 0));
     setIsProductModalOpen(true);
@@ -429,77 +421,13 @@ export const AdminPanel: React.FC<AdminPanelProps> = ({
     setIsProductModalOpen(true);
   };
 
-  // Club & Brand Presets for 1-Click Category Creation
-  const CLUB_PRESETS = [
-    {
-      name: 'Real Madrid',
-      subtitle: '24/25 Champions',
-      tag: 'La Liga',
-      image: 'https://upload.wikimedia.org/wikipedia/en/thumb/5/56/Real_Madrid_CF.svg/300px-Real_Madrid_CF.svg.png'
-    },
-    {
-      name: 'FC Barcelona',
-      subtitle: 'Blaugrana Pride',
-      tag: 'La Liga',
-      image: 'https://upload.wikimedia.org/wikipedia/en/thumb/4/47/FC_Barcelona_%28crest%29.svg/300px-FC_Barcelona_%28crest%29.svg.png'
-    },
-    {
-      name: 'Manchester United',
-      subtitle: 'Red Devils',
-      tag: 'Premier League',
-      image: 'https://upload.wikimedia.org/wikipedia/en/thumb/7/7a/Manchester_United_FC_crest.svg/300px-Manchester_United_FC_crest.svg.png'
-    },
-    {
-      name: 'Arsenal',
-      subtitle: 'Gunners Edition',
-      tag: 'Premier League',
-      image: 'https://upload.wikimedia.org/wikipedia/en/thumb/5/53/Arsenal_FC.svg/300px-Arsenal_FC.svg.png'
-    },
-    {
-      name: 'Manchester City',
-      subtitle: 'Sky Blue Dynasty',
-      tag: 'Premier League',
-      image: 'https://upload.wikimedia.org/wikipedia/en/thumb/e/eb/Manchester_City_FC_badge.svg/300px-Manchester_City_FC_badge.svg.png'
-    },
-    {
-      name: 'Liverpool',
-      subtitle: 'Anfield Legends',
-      tag: 'Premier League',
-      image: 'https://upload.wikimedia.org/wikipedia/en/thumb/0/0c/Liverpool_FC.svg/300px-Liverpool_FC.svg.png'
-    },
-    {
-      name: 'Chelsea',
-      subtitle: 'The Blues',
-      tag: 'Premier League',
-      image: 'https://upload.wikimedia.org/wikipedia/en/thumb/c/cc/Chelsea_FC.svg/300px-Chelsea_FC.svg.png'
-    },
-    {
-      name: 'Bayern Munich',
-      subtitle: 'Mia San Mia',
-      tag: 'Bundesliga',
-      image: 'https://upload.wikimedia.org/wikipedia/commons/thumb/1/1b/FC_Bayern_M%C3%BCnchen_logo_%282017%29.svg/300px-FC_Bayern_M%C3%BCnchen_logo_%282017%29.svg.png'
-    },
-    {
-      name: 'Argentina',
-      subtitle: '3-Star World Champions',
-      tag: 'National',
-      image: 'https://upload.wikimedia.org/wikipedia/en/thumb/a/a2/Argentine_Football_Association_logo.svg/300px-Argentine_Football_Association_logo.svg.png'
-    },
-    {
-      name: 'Brazil',
-      subtitle: 'Pentacampeão',
-      tag: 'National',
-      image: 'https://upload.wikimedia.org/wikipedia/en/thumb/9/99/Brazilian_Football_Confederation_logo.svg/300px-Brazilian_Football_Confederation_logo.svg.png'
-    }
-  ];
-
   // Open Category Modal
   const openAddCategoryModal = () => {
     setEditingCatId(null);
     setCatName('');
     setCatSubtitle('');
-    setCatImage('https://upload.wikimedia.org/wikipedia/en/thumb/5/56/Real_Madrid_CF.svg/300px-Real_Madrid_CF.svg.png');
-    setCatTag('Drop');
+    setCatImage('');
+    setCatTag('');
     setIsCatModalOpen(true);
   };
 
@@ -507,7 +435,7 @@ export const AdminPanel: React.FC<AdminPanelProps> = ({
     setEditingCatId(cat.id);
     setCatName(cat.name);
     setCatSubtitle(cat.subtitle || '');
-    setCatImage(cat.image || 'https://upload.wikimedia.org/wikipedia/en/thumb/5/56/Real_Madrid_CF.svg/300px-Real_Madrid_CF.svg.png');
+    setCatImage(cat.image || '');
     setCatTag(cat.tag || '');
     setIsCatModalOpen(true);
   };
@@ -746,8 +674,8 @@ export const AdminPanel: React.FC<AdminPanelProps> = ({
       description: formDescription.trim(),
       stockCount: parseInt(formStockCount, 10) || 15,
       inStock: formInStock,
-      images: formImages.length > 0 ? formImages : ['/images/prod_pixel_case_1787668274006.jpg'],
-      features: formFeatures.length > 0 ? formFeatures : ['Moisture-wicking breathable ventilation matrix'],
+      images: formImages,
+      features: formFeatures,
       sizes: formSizes.length > 0 ? formSizes : ['S', 'M', 'L', 'XL', 'XXL', '3XL'],
       customizable: true,
       customizationChargeType: formCustomizationChargeType,
@@ -1597,13 +1525,17 @@ export const AdminPanel: React.FC<AdminPanelProps> = ({
                           </div>
                         </div>
 
-                        <div className="relative w-12 h-12 rounded-xl bg-white p-1 border border-neutral-200 shadow-sm shrink-0 overflow-hidden">
-                          <img
-                            src={prod.images?.[0] || 'https://images.unsplash.com/photo-1577212017184-80cc0da11082?auto=format&fit=crop&w=200&q=80'}
-                            alt={prod.title}
-                            referrerPolicy="no-referrer"
-                            className="w-full h-full object-contain"
-                          />
+                        <div className="relative w-12 h-12 rounded-xl bg-white p-1 border border-neutral-200 shadow-sm shrink-0 overflow-hidden flex items-center justify-center">
+                          {prod.images && prod.images[0] ? (
+                            <img
+                              src={prod.images[0]}
+                              alt={prod.title}
+                              referrerPolicy="no-referrer"
+                              className="w-full h-full object-contain"
+                            />
+                          ) : (
+                            <Package className="w-5 h-5 text-neutral-300" />
+                          )}
                         </div>
 
                         <div className="min-w-0">
@@ -3880,15 +3812,21 @@ export const AdminPanel: React.FC<AdminPanelProps> = ({
             {/* Target Category Summary Card */}
             <div className="p-3 bg-neutral-50 rounded-2xl border border-neutral-200 flex items-center gap-3">
               <div className="w-14 h-14 rounded-xl bg-white border border-neutral-200 overflow-hidden shrink-0 flex items-center justify-center p-1">
-                <img
-                  src={categoryPendingDelete.image || 'https://images.unsplash.com/photo-1577212017184-80cc0da11082?auto=format&fit=crop&w=400&q=80'}
-                  alt={categoryPendingDelete.name}
-                  referrerPolicy="no-referrer"
-                  onError={(e) => {
-                    (e.currentTarget as HTMLImageElement).src = 'https://images.unsplash.com/photo-1577212017184-80cc0da11082?auto=format&fit=crop&w=400&q=80';
-                  }}
-                  className="w-full h-full object-cover rounded-lg"
-                />
+                {categoryPendingDelete.image ? (
+                  <img
+                    src={categoryPendingDelete.image}
+                    alt={categoryPendingDelete.name}
+                    referrerPolicy="no-referrer"
+                    onError={(e) => {
+                      (e.currentTarget as HTMLImageElement).style.display = 'none';
+                    }}
+                    className="w-full h-full object-cover rounded-lg"
+                  />
+                ) : (
+                  <div className="w-full h-full flex items-center justify-center text-xs font-bold text-neutral-400 bg-neutral-100 rounded-lg">
+                    {categoryPendingDelete.name.slice(0, 2).toUpperCase()}
+                  </div>
+                )}
               </div>
               <div className="flex-1 min-w-0">
                 <div className="text-xs font-mono text-neutral-500 font-semibold truncate">

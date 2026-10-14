@@ -714,9 +714,9 @@ export const OrderProcessManager: React.FC<OrderProcessManagerProps> = ({
           title: it.title || 'Official Club Jersey',
           price: 650,
           category: 'Retro Club',
-          images: [it.imageUrl || 'https://images.unsplash.com/photo-1577212017184-80cc0da11082?auto=format&fit=crop&w=200&q=80'],
+          images: it.imageUrl ? [it.imageUrl] : [],
           sizes: ['M', 'L', 'XL', 'XXL'],
-          description: 'Official kit',
+          description: '',
           inStock: true,
           rating: 4.9,
           code: it.code || 'SJ-PRO'
@@ -1036,7 +1036,7 @@ export const OrderProcessManager: React.FC<OrderProcessManagerProps> = ({
                 {stagedOrders.map((order, orderIdx) => {
                   const hasPhoneError = !order.phoneNumber || order.phoneNumber.length !== 11;
                   const firstItem = order.items?.[0];
-                  const thumbnailImg = firstItem?.matchedProduct?.images?.[0] || 'https://images.unsplash.com/photo-1577212017184-80cc0da11082?auto=format&fit=crop&w=150&q=80';
+                  const thumbnailImg = firstItem?.matchedProduct?.images?.[0] || '';
 
                   return (
                     <tr key={order.tempId} className="hover:bg-amber-50/30 transition-colors">
@@ -1048,12 +1048,16 @@ export const OrderProcessManager: React.FC<OrderProcessManagerProps> = ({
                       {/* Image Thumbnail Detection */}
                       <td className="py-2.5 px-3">
                         <div className="w-12 h-12 rounded-xl border border-neutral-200 bg-neutral-50 p-1 shrink-0 overflow-hidden flex items-center justify-center shadow-2xs">
-                          <img
-                            src={thumbnailImg}
-                            alt="Jersey"
-                            referrerPolicy="no-referrer"
-                            className="w-full h-full object-contain"
-                          />
+                          {thumbnailImg ? (
+                            <img
+                              src={thumbnailImg}
+                              alt="Product"
+                              referrerPolicy="no-referrer"
+                              className="w-full h-full object-contain"
+                            />
+                          ) : (
+                            <span className="text-[9px] text-neutral-400 font-bold">ITEM</span>
+                          )}
                         </div>
                       </td>
 
@@ -1488,7 +1492,7 @@ export const OrderProcessManager: React.FC<OrderProcessManagerProps> = ({
                 filteredSavedOrders.map((order, idx) => {
                   const isSelected = selectedOrderIds.has(order.id);
                   const firstItem = order.items?.[0];
-                  const thumbnailImg = firstItem?.product?.images?.[0] || 'https://images.unsplash.com/photo-1577212017184-80cc0da11082?auto=format&fit=crop&w=150&q=80';
+                  const thumbnailImg = firstItem?.product?.images?.[0] || '';
                   const codAmt = order.codAmount !== undefined ? order.codAmount : order.totalAmount;
 
                   return (
@@ -1521,12 +1525,16 @@ export const OrderProcessManager: React.FC<OrderProcessManagerProps> = ({
                       {/* Thumbnail Image */}
                       <td className="py-3 px-3">
                         <div className="w-11 h-11 rounded-xl border border-neutral-200 bg-neutral-50 p-1 shrink-0 overflow-hidden flex items-center justify-center">
-                          <img
-                            src={thumbnailImg}
-                            alt="Jersey"
-                            referrerPolicy="no-referrer"
-                            className="w-full h-full object-contain"
-                          />
+                          {thumbnailImg ? (
+                            <img
+                              src={thumbnailImg}
+                              alt="Product"
+                              referrerPolicy="no-referrer"
+                              className="w-full h-full object-contain"
+                            />
+                          ) : (
+                            <span className="text-[9px] text-neutral-400 font-bold">ITEM</span>
+                          )}
                         </div>
                       </td>
 
