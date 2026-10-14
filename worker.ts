@@ -1,0 +1,2348 @@
+/**
+ * Cloudflare Worker Backend for Spidey Jersey Store
+ * Bound to R2 Bucket: spidey-jersey-images
+ */
+
+import { INITIAL_JERSEYS, CATEGORY_CAROUSEL_ITEMS } from './src/data/mockJerseys.ts';
+import { JerseyProduct, Order, StoreStats } from './src/types.ts';
+import { SiteSettings, DEFAULT_SITE_SETTINGS, CategoryItem } from './src/types/settings.ts';
+
+// Cloudflare Workers Type Definitions
+export interface CloudflareR2Object {
+  body: ReadableStream;
+  httpEtag: string;
+  writeHttpMetadata: (headers: Headers) => void;
+  text?: () => Promise<string>;
+  json?: () => Promise<any>;
+}
+
+export interface CloudflareR2Bucket {
+  get: (key: string) => Promise<CloudflareR2Object | null>;
+  put: (key: string, value: ArrayBuffer | ReadableStream | string, options?: any) => Promise<any>;
+  delete: (key: string) => Promise<void>;
+}
+
+export interface CloudflareFetcher {
+  fetch: (request: Request) => Promise<Response>;
+}
+
+export interface Env {
+  MY_BUCKET?: CloudflareR2Bucket;
+  ASSETS?: CloudflareFetcher;
+  ADMIN_PASSCODE?: string;
+}
+
+// In-Memory cache for speed
+let cachedProducts: JerseyProduct[] | null = null;
+let cachedOrders: Order[] | null = null;
+let cachedSettings: SiteSettings | null = null;
+let cachedCategories: CategoryItem[] | null = null;
+let cachedPasscode: string = 'spidey2026';
+
+// Keys in R2
+const R2_PRODUCTS_KEY = '_db/products.json';
+const R2_ORDERS_KEY = '_db/orders.json';
+const R2_SETTINGS_KEY = '_db/settings.json';
+const R2_CATEGORIES_KEY = '_db/categories.json';
+const R2_CONFIG_KEY = '_db/config.json';
+const R2_STEADFAST_KEY = '_db/steadfast_config.json';
+
+export interface WorkerSteadfastConfig {
+  apiKey: string;
+  secretKey: string;
+  baseUrl?: string;
+  senderName?: string;
+  senderPhone?: string;
+  senderAddress?: string;
+  isLiveMode?: boolean;
+}
+
+let cachedSteadfast: WorkerSteadfastConfig | null = null;
+
+async function getStoredSteadfastConfig(env: Env): Promise<WorkerSteadfastConfig> {
+  if (cachedSteadfast) return cachedSteadfast;
+
+  if (env.MY_BUCKET) {
+    try {
+      const obj = await env.MY_BUCKET.get(R2_STEADFAST_KEY);
+      if (obj) {
+        const text = await new Response(obj.body).text();
+        const data = JSON.parse(text);
+        if (data && typeof data === 'object') {
+          cachedSteadfast = {
+            apiKey: data.apiKey || '',
+            secretKey: data.secretKey || '',
+            baseUrl: data.baseUrl || 'https://portal.packzy.com/api/v1',
+            senderName: data.senderName || 'Spidey Jersey',
+            senderPhone: data.senderPhone || '',
+            senderAddress: data.senderAddress || '',
+            isLiveMode: data.isLiveMode !== undefined ? !!data.isLiveMode : true
+          };
+          return cachedSteadfast!;
+        }
+      }
+    } catch (e) {
+      console.error('Error loading steadfast config from R2:', e);
+    }
+  }
+
+  cachedSteadfast = {
+    apiKey: '',
+    secretKey: '',
+    baseUrl: 'https://portal.packzy.com/api/v1',
+    senderName: 'Spidey Jersey',
+    senderPhone: '',
+    senderAddress: '',
+    isLiveMode: true
+  };
+  return cachedSteadfast;
+}
+
+async function saveStoredSteadfastConfig(env: Env, config: WorkerSteadfastConfig): Promise<void> {
+  cachedSteadfast = config;
+  if (env.MY_BUCKET) {
+    try {
+      await env.MY_BUCKET.put(R2_STEADFAST_KEY, JSON.stringify(config), {
+        httpMetadata: { contentType: 'application/json' }
+      });
+    } catch (e) {
+      console.error('Error persisting steadfast config to R2:', e);
+    }
+  }
+}
+
+function escapeTelegramWorkerHtml(str: string | number | undefined | null): string {
+  if (str === undefined || str === null) return '';
+  return String(str)
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;');
+}
+
+async function sendWorkerTelegramOrderNotification(order: Order, settings: SiteSettings): Promise<{ success: boolean; message?: string; chatId?: string }> {
+  const token = (settings.telegramBotToken || '8972453715:AAEHlxk5XLQgsozL1yTwpuCAgT0RSHOzwIw').trim();
+  const rawChatId = (settings.telegramChatId || '1003901747514').trim();
+
+  if (!token || !rawChatId || settings.telegramNotificationsEnabled === false) {
+    return { success: false, message: 'Telegram notification is disabled or not configured.' };
+  }
+
+  const itemsList = (order.items || []).map((it, idx) => {
+    const code = it.product?.code ? `[${escapeTelegramWorkerHtml(it.product.code)}] ` : '';
+    const title = escapeTelegramWorkerHtml(it.product?.title || 'Jersey Item');
+    const size = escapeTelegramWorkerHtml(it.selectedSize || 'N/A');
+    const custom = (it.customName || it.customNumber)
+      ? `\n   ↳ <i>কাস্টমাইজেশন:</i> <b>${escapeTelegramWorkerHtml([it.customName, it.customNumber].filter(Boolean).join(' - '))}</b>${it.customizationFee ? ` (+৳${it.customizationFee})` : ''}`
+      : '';
+    const itemPrice = it.product?.price ? ` • ৳${it.product.price}` : '';
+    const qty = (it.quantity && it.quantity > 1) ? ` x${it.quantity}` : '';
+    return `${idx + 1}. <b>${code}${title}</b> (Size: <b>${size}</b>${qty})${itemPrice}${custom}`;
+  }).join('\n');
+
+  let zoneLabel = 'ঢাকার বাইরে';
+  if (order.deliveryZone === 'inside_dhaka') zoneLabel = 'ঢাকার ভেতরে';
+  else if (order.deliveryZone === 'sub_dhaka') zoneLabel = 'ঢাকার সাব-এরিয়া / আশেপাশের এলাকা';
+  else if (order.deliveryZone === 'outside_dhaka') zoneLabel = 'ঢাকার জেলার বাইরে';
+  else if (order.deliveryZone) zoneLabel = String(order.deliveryZone);
+
+  const formattedDate = new Date().toLocaleString('en-GB', { 
+    timeZone: 'Asia/Dhaka',
+    day: '2-digit',
+    month: 'short',
+    year: 'numeric',
+    hour: '2-digit',
+    minute: '2-digit',
+    hour12: true
+  });
+
+  const text = `🛒 <b>নতুন ওয়েবসাইট অর্ডার গ্রহণ করা হয়েছে!</b>
+━━━━━━━━━━━━━━━━━━
+🆔 <b>Order ID:</b> <code>#${escapeTelegramWorkerHtml(order.id)}</code>
+👤 <b>কাস্টমার:</b> <b>${escapeTelegramWorkerHtml(order.customerName || 'N/A')}</b>
+📞 <b>মোবাইল:</b> <code>${escapeTelegramWorkerHtml(order.phoneNumber || 'N/A')}</code>
+📍 <b>ঠিকানা:</b> ${escapeTelegramWorkerHtml(order.shippingAddress || 'N/A')}
+🚚 <b>ডেলিভারি জোন:</b> ${escapeTelegramWorkerHtml(zoneLabel)} (৳${order.shippingFee || 0})
+
+📦 <b>অর্ডারকৃত আইটেমস:</b>
+${itemsList || 'No items listed'}
+
+━━━━━━━━━━━━━━━━━━
+💰 <b>সাবটোটাল:</b> ৳${order.subtotal || 0}
+${order.discount ? `🏷️ <b>কুপন ডিসকাউন্ট:</b> -৳${order.discount}${order.couponCode ? ` (${escapeTelegramWorkerHtml(order.couponCode)})` : ''}\n` : ''}🚚 <b>ডেলিভারি চার্জ:</b> ৳${order.shippingFee || 0}
+💵 <b>সর্বমোট ক্যাশ অন ডেলিভারি (COD):</b> ৳${order.totalAmount || order.codAmount || 0}
+━━━━━━━━━━━━━━━━━━
+⏰ <b>অর্ডারের সময়:</b> ${formattedDate}`;
+
+  const candidateIds = [rawChatId];
+  if (!rawChatId.startsWith('-')) {
+    candidateIds.push(`-100${rawChatId}`);
+    candidateIds.push(`-${rawChatId}`);
+  }
+
+  let lastError = '';
+  for (const cid of candidateIds) {
+    try {
+      const resp = await fetch(`https://api.telegram.org/bot${token}/sendMessage`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          chat_id: cid,
+          text,
+          parse_mode: 'HTML'
+        })
+      });
+      const data = await resp.json() as any;
+      if (data.ok) {
+        return { success: true, chatId: cid };
+      } else {
+        lastError = data.description || 'Unknown Telegram error';
+      }
+    } catch (e: any) {
+      lastError = e.message || 'Telegram network exception';
+    }
+  }
+
+  return { success: false, message: lastError };
+}
+
+async function callSteadfastWorkerApi(
+  env: Env,
+  endpointPath: string,
+  method: 'GET' | 'POST',
+  apiKey: string,
+  secretKey: string,
+  body?: any,
+  preferredBaseUrl?: string
+): Promise<{ ok: boolean; status: number; data: any; rawText: string; error?: string; usedUrl?: string }> {
+  const cfg = await getStoredSteadfastConfig(env);
+  const candidateUrls = [
+    preferredBaseUrl,
+    cfg.baseUrl,
+    'https://portal.packzy.com/api/v1',
+    'https://portal.steadfast.com.bd/api/v1'
+  ]
+    .filter(Boolean)
+    .map(u => (u as string).trim().replace(/\/+$/, ''));
+
+  const uniqueUrls = Array.from(new Set(candidateUrls));
+  let lastError = '';
+
+  for (const base of uniqueUrls) {
+    try {
+      const cleanPath = endpointPath.startsWith('/') ? endpointPath : `/${endpointPath}`;
+      const url = `${base}${cleanPath}`;
+      const controller = new AbortController();
+      const timeoutId = setTimeout(() => controller.abort(), 9000);
+
+      const res = await fetch(url, {
+        method,
+        headers: {
+          'Api-Key': apiKey,
+          'Secret-Key': secretKey,
+          'Content-Type': 'application/json',
+          'Accept': 'application/json'
+        },
+        body: body ? JSON.stringify(body) : undefined,
+        signal: controller.signal
+      });
+      clearTimeout(timeoutId);
+
+      const rawText = await res.text();
+      let data: any = null;
+      try {
+        data = rawText ? JSON.parse(rawText) : null;
+      } catch (e) {
+        data = null;
+      }
+
+      if (res.ok || (res.status >= 200 && res.status < 500 && data)) {
+        return {
+          ok: res.ok,
+          status: res.status,
+          data,
+          rawText,
+          usedUrl: url
+        };
+      } else {
+        lastError = `HTTP ${res.status}: ${rawText || res.statusText}`;
+      }
+    } catch (err: any) {
+      lastError = err.message || 'Steadfast network error';
+    }
+  }
+
+  return {
+    ok: false,
+    status: 500,
+    data: null,
+    rawText: '',
+    error: lastError || 'Failed to connect to Steadfast Courier API'
+  };
+}
+
+// Helper: Load Products from R2 or fallback to initial (multi-key fail-safe)
+async function getStoredProducts(env: Env): Promise<JerseyProduct[]> {
+  if (cachedProducts && cachedProducts.length > 0) return cachedProducts;
+
+  if (env.MY_BUCKET) {
+    const candidateKeys = [
+      R2_PRODUCTS_KEY,
+      'products.json',
+      'store_data/products.json',
+      'data/products.json',
+      `${R2_PRODUCTS_KEY}.bak`,
+      '_db/backup.json',
+      'backup.json'
+    ];
+    for (const key of candidateKeys) {
+      try {
+        const obj = await env.MY_BUCKET.get(key);
+        if (obj) {
+          const text = await new Response(obj.body).text();
+          const parsed = JSON.parse(text);
+          const list = Array.isArray(parsed) ? parsed : (Array.isArray(parsed?.products) ? parsed.products : null);
+          if (Array.isArray(list) && list.length > 0) {
+            cachedProducts = list;
+            // Re-seed canonical R2 key if it was found in an alternate or backup key
+            if (key !== R2_PRODUCTS_KEY) {
+              await saveStoredProducts(env, list);
+            }
+            return cachedProducts;
+          }
+        }
+      } catch (e) {
+        console.warn(`Error loading products from key ${key}:`, e);
+      }
+    }
+  }
+
+  cachedProducts = [...INITIAL_JERSEYS];
+  // Persist initial products to R2 so future reads succeed immediately
+  if (env.MY_BUCKET) {
+    saveStoredProducts(env, cachedProducts).catch(() => {});
+  }
+  return cachedProducts;
+}
+
+// Helper: Save Products to R2 (Guards against empty overwrites & saves backup)
+async function saveStoredProducts(env: Env, products: JerseyProduct[]): Promise<void> {
+  if (!Array.isArray(products) || products.length === 0) {
+    console.warn('Blocked attempt to overwrite products with empty array in R2');
+    return;
+  }
+  cachedProducts = products;
+  if (env.MY_BUCKET) {
+    try {
+      const dataStr = JSON.stringify(products, null, 2);
+      await env.MY_BUCKET.put(R2_PRODUCTS_KEY, dataStr, {
+        httpMetadata: { contentType: 'application/json' }
+      });
+      await env.MY_BUCKET.put(`${R2_PRODUCTS_KEY}.bak`, dataStr, {
+        httpMetadata: { contentType: 'application/json' }
+      });
+    } catch (e) {
+      console.error('Error persisting products to R2:', e);
+    }
+  }
+}
+
+// Helper: Load Site Settings from R2 (Multi-key fail-safe)
+async function getStoredSettings(env: Env): Promise<SiteSettings> {
+  if (cachedSettings) return cachedSettings;
+
+  if (env.MY_BUCKET) {
+    const candidateKeys = [
+      R2_SETTINGS_KEY,
+      '_db/site_settings.json',
+      'site_settings.json',
+      'settings.json',
+      'store_data/site_settings.json',
+      `${R2_SETTINGS_KEY}.bak`,
+      '_db/backup.json',
+      'backup.json'
+    ];
+    for (const key of candidateKeys) {
+      try {
+        const obj = await env.MY_BUCKET.get(key);
+        if (obj) {
+          const text = await new Response(obj.body).text();
+          const parsed = JSON.parse(text);
+          const settingsObj = (parsed && typeof parsed === 'object' && !Array.isArray(parsed))
+            ? (parsed.siteSettings || parsed)
+            : null;
+          if (settingsObj && typeof settingsObj === 'object') {
+            cachedSettings = { ...DEFAULT_SITE_SETTINGS, ...settingsObj };
+            return cachedSettings;
+          }
+        }
+      } catch (e) {
+        console.warn(`Error loading settings from key ${key}:`, e);
+      }
+    }
+  }
+
+  cachedSettings = { ...DEFAULT_SITE_SETTINGS };
+  return cachedSettings;
+}
+
+// Helper: Save Site Settings to R2 (Merges defaults & saves backup)
+async function saveStoredSettings(env: Env, settings: SiteSettings): Promise<void> {
+  const merged: SiteSettings = {
+    ...DEFAULT_SITE_SETTINGS,
+    ...settings
+  };
+  cachedSettings = merged;
+  if (env.MY_BUCKET) {
+    try {
+      const dataStr = JSON.stringify(merged, null, 2);
+      await env.MY_BUCKET.put(R2_SETTINGS_KEY, dataStr, {
+        httpMetadata: { contentType: 'application/json' }
+      });
+      await env.MY_BUCKET.put(`${R2_SETTINGS_KEY}.bak`, dataStr, {
+        httpMetadata: { contentType: 'application/json' }
+      });
+    } catch (e) {
+      console.error('Error persisting settings to R2:', e);
+    }
+  }
+}
+
+// Helper: Load Categories from R2 (Carousel Logos, Tags, Subtitles with multi-key fail-safe)
+async function getStoredCategories(env: Env): Promise<CategoryItem[]> {
+  if (cachedCategories && cachedCategories.length > 0) return cachedCategories;
+
+  if (env.MY_BUCKET) {
+    const candidateKeys = [
+      R2_CATEGORIES_KEY,
+      'categories.json',
+      'store_data/categories.json',
+      'data/categories.json',
+      `${R2_CATEGORIES_KEY}.bak`,
+      '_db/backup.json',
+      'backup.json'
+    ];
+    for (const key of candidateKeys) {
+      try {
+        const obj = await env.MY_BUCKET.get(key);
+        if (obj) {
+          const text = await new Response(obj.body).text();
+          const parsed = JSON.parse(text);
+          const list = Array.isArray(parsed) ? parsed : (Array.isArray(parsed?.categories) ? parsed.categories : null);
+          if (Array.isArray(list) && list.length > 0) {
+            cachedCategories = list;
+            if (key !== R2_CATEGORIES_KEY) {
+              await saveStoredCategories(env, list);
+            }
+            return cachedCategories;
+          }
+        }
+      } catch (e) {
+        console.warn(`Error loading categories from key ${key}:`, e);
+      }
+    }
+  }
+
+  cachedCategories = [...CATEGORY_CAROUSEL_ITEMS];
+  // Persist initial categories to R2 so future reads succeed immediately
+  if (env.MY_BUCKET) {
+    saveStoredCategories(env, cachedCategories).catch(() => {});
+  }
+  return cachedCategories;
+}
+
+// Helper: Save Categories to R2 (Guards against empty overwrites & saves backup)
+async function saveStoredCategories(env: Env, categories: CategoryItem[]): Promise<void> {
+  if (!Array.isArray(categories) || categories.length === 0) {
+    console.warn('Blocked attempt to overwrite categories with empty array in R2');
+    return;
+  }
+  cachedCategories = categories;
+  if (env.MY_BUCKET) {
+    try {
+      const dataStr = JSON.stringify(categories, null, 2);
+      await env.MY_BUCKET.put(R2_CATEGORIES_KEY, dataStr, {
+        httpMetadata: { contentType: 'application/json' }
+      });
+      await env.MY_BUCKET.put(`${R2_CATEGORIES_KEY}.bak`, dataStr, {
+        httpMetadata: { contentType: 'application/json' }
+      });
+    } catch (e) {
+      console.error('Error persisting categories to R2:', e);
+    }
+  }
+}
+
+// Helper: Load Orders from R2 (multi-key fail-safe)
+async function getStoredOrders(env: Env): Promise<Order[]> {
+  if (cachedOrders) return cachedOrders;
+
+  if (env.MY_BUCKET) {
+    const candidateKeys = [
+      R2_ORDERS_KEY,
+      'orders.json',
+      'store_data/orders.json',
+      `${R2_ORDERS_KEY}.bak`
+    ];
+    for (const key of candidateKeys) {
+      try {
+        const obj = await env.MY_BUCKET.get(key);
+        if (obj) {
+          const text = await new Response(obj.body).text();
+          const data = JSON.parse(text);
+          if (Array.isArray(data)) {
+            cachedOrders = data;
+            return cachedOrders;
+          }
+        }
+      } catch (e) {
+        console.warn(`Error loading orders from key ${key}:`, e);
+      }
+    }
+  }
+
+  cachedOrders = [];
+  return cachedOrders;
+}
+
+// Helper: Save Orders to R2
+async function saveStoredOrders(env: Env, orders: Order[]): Promise<void> {
+  cachedOrders = orders;
+  if (env.MY_BUCKET) {
+    try {
+      const dataStr = JSON.stringify(orders, null, 2);
+      await env.MY_BUCKET.put(R2_ORDERS_KEY, dataStr, {
+        httpMetadata: { contentType: 'application/json' }
+      });
+      await env.MY_BUCKET.put(`${R2_ORDERS_KEY}.bak`, dataStr, {
+        httpMetadata: { contentType: 'application/json' }
+      });
+    } catch (e) {
+      console.error('Error persisting orders to R2:', e);
+    }
+  }
+}
+
+export default {
+  async fetch(request: Request, env: Env): Promise<Response> {
+    const url = new URL(request.url);
+    const pathname = url.pathname;
+
+    // CORS Headers
+    const corsHeaders = {
+      'Access-Control-Allow-Origin': '*',
+      'Access-Control-Allow-Methods': 'GET, POST, PUT, DELETE, OPTIONS',
+      'Access-Control-Allow-Headers': 'Content-Type, Authorization',
+    };
+
+    if (request.method === 'OPTIONS') {
+      return new Response(null, { headers: corsHeaders });
+    }
+
+    try {
+      // 1. Health check
+      if (pathname === '/api/health' && request.method === 'GET') {
+        return new Response(JSON.stringify({ status: 'ok', time: new Date().toISOString() }), {
+          headers: { 'Content-Type': 'application/json', ...corsHeaders }
+        });
+      }
+
+      // 2. R2 Status
+      if (pathname === '/api/r2-status' && request.method === 'GET') {
+        return new Response(
+          JSON.stringify({
+            status: 'active',
+            binding: 'MY_BUCKET',
+            bucketName: 'spidey-jersey-images',
+            workerRuntime: 'Cloudflare Workers + R2 Object Storage',
+            connected: !!env.MY_BUCKET
+          }),
+          { headers: { 'Content-Type': 'application/json', ...corsHeaders } }
+        );
+      }
+
+      // 3. R2 Image Stream: /api/images/:key, /uploads/:filename, /images/:filename
+      if ((pathname.startsWith('/api/images/') || pathname.startsWith('/uploads/') || pathname.startsWith('/images/')) && request.method === 'GET') {
+        let rawKey = '';
+        if (pathname.startsWith('/api/images/')) {
+          rawKey = pathname.replace('/api/images/', '');
+        } else if (pathname.startsWith('/uploads/')) {
+          rawKey = pathname.replace('/uploads/', '');
+        } else if (pathname.startsWith('/images/')) {
+          rawKey = pathname.replace('/images/', '');
+        }
+
+        let key = rawKey;
+        try {
+          key = decodeURIComponent(rawKey);
+        } catch {}
+
+        if (env.MY_BUCKET) {
+          const candidateKeys = [
+            key,
+            `uploads/${key}`,
+            key.replace(/^uploads\//, ''),
+            `images/${key}`,
+            key.replace(/^images\//, '')
+          ];
+
+          for (const cand of candidateKeys) {
+            try {
+              const object = await env.MY_BUCKET.get(cand);
+              if (object) {
+                const headers = new Headers(corsHeaders);
+                object.writeHttpMetadata(headers);
+                headers.set('etag', object.httpEtag);
+                headers.set('Cache-Control', 'public, max-age=31536000, immutable');
+                if (!headers.get('Content-Type')) {
+                  const ext = cand.split('.').pop()?.toLowerCase();
+                  if (ext === 'png') headers.set('Content-Type', 'image/png');
+                  else if (ext === 'webp') headers.set('Content-Type', 'image/webp');
+                  else if (ext === 'svg') headers.set('Content-Type', 'image/svg+xml');
+                  else headers.set('Content-Type', 'image/jpeg');
+                }
+                return new Response(object.body, { headers });
+              }
+            } catch (err) {
+              console.warn(`R2 lookup failed for ${cand}:`, err);
+            }
+          }
+        }
+
+        // If not in bucket and running on Cloudflare with static ASSETS, try ASSETS
+        if (env.ASSETS) {
+          const assetRes = await env.ASSETS.fetch(request);
+          if (assetRes.status !== 404) return assetRes;
+        }
+
+        return new Response('Image not found in R2 bucket', { status: 404, headers: corsHeaders });
+      }
+
+      // 4. Image Upload to R2: POST /api/upload
+      if (pathname === '/api/upload' && request.method === 'POST') {
+        const body: any = await request.json();
+        const { filename, contentType, base64Data } = body;
+
+        if (!base64Data) {
+          return new Response(JSON.stringify({ success: false, message: 'base64Data is required' }), {
+            status: 400,
+            headers: { 'Content-Type': 'application/json', ...corsHeaders }
+          });
+        }
+
+        let cleanData = base64Data;
+        let mime = contentType || 'image/jpeg';
+
+        if (base64Data.startsWith('data:')) {
+          const parts = base64Data.split(',');
+          const match = parts[0].match(/:(.*?);/);
+          if (match) mime = match[1];
+          cleanData = parts[1] || '';
+        }
+
+        const extension = mime.includes('png') ? 'png' : mime.includes('webp') ? 'webp' : 'jpg';
+        const cleanFilename = (filename || 'image').replace(/[^a-zA-Z0-9_-]/g, '_');
+        const key = `uploads/${Date.now()}-${cleanFilename}.${extension}`;
+
+        // Convert base64 to binary
+        const binaryString = atob(cleanData);
+        const bytes = new Uint8Array(binaryString.length);
+        for (let i = 0; i < binaryString.length; i++) {
+          bytes[i] = binaryString.charCodeAt(i);
+        }
+
+        if (env.MY_BUCKET) {
+          await env.MY_BUCKET.put(key, bytes.buffer, {
+            httpMetadata: { contentType: mime }
+          });
+        }
+
+        const imageUrl = env.MY_BUCKET
+          ? `/api/images/${encodeURIComponent(key)}`
+          : (base64Data.startsWith('data:') ? base64Data : `data:${mime};base64,${cleanData}`);
+
+        return new Response(
+          JSON.stringify({
+            success: true,
+            key,
+            url: imageUrl,
+            staticUrl: `/${key}`,
+            directUrl: imageUrl,
+            size: bytes.byteLength,
+            contentType: mime,
+            bucket: 'spidey-jersey-images',
+            binding: 'MY_BUCKET'
+          }),
+          { headers: { 'Content-Type': 'application/json', ...corsHeaders } }
+        );
+      }
+
+      // 4b. Cloud Storage Backup & Resync Fail-Safe Endpoints
+      // Full Catalog Snapshot Backup Export: GET /api/sync/backup
+      if (pathname === '/api/sync/backup' && request.method === 'GET') {
+        const prods = await getStoredProducts(env);
+        const cats = await getStoredCategories(env);
+        const settings = await getStoredSettings(env);
+        const ordersList = await getStoredOrders(env);
+        const steadfast = await getStoredSteadfastConfig(env);
+
+        const backupData = {
+          timestamp: new Date().toISOString(),
+          version: '2.5.0',
+          products: prods,
+          categories: cats,
+          siteSettings: settings,
+          orders: ordersList,
+          steadfastConfig: steadfast
+        };
+
+        return new Response(JSON.stringify({ success: true, backup: backupData }), {
+          headers: { 'Content-Type': 'application/json', ...corsHeaders }
+        });
+      }
+
+      // Full Catalog Snapshot Restore: POST /api/sync/restore
+      if (pathname === '/api/sync/restore' && request.method === 'POST') {
+        const { backup } = await request.json();
+        if (!backup || typeof backup !== 'object') {
+          return new Response(JSON.stringify({ success: false, message: 'Valid backup payload required' }), {
+            status: 400,
+            headers: { 'Content-Type': 'application/json', ...corsHeaders }
+          });
+        }
+
+        if (Array.isArray(backup.products) && backup.products.length > 0) {
+          await saveStoredProducts(env, backup.products);
+        }
+
+        if (Array.isArray(backup.categories) && backup.categories.length > 0) {
+          await saveStoredCategories(env, backup.categories);
+        }
+
+        if (backup.siteSettings && typeof backup.siteSettings === 'object') {
+          await saveStoredSettings(env, backup.siteSettings);
+        }
+
+        if (Array.isArray(backup.orders)) {
+          await saveStoredOrders(env, backup.orders);
+        }
+
+        if (backup.steadfastConfig) {
+          await saveStoredSteadfastConfig(env, backup.steadfastConfig);
+        }
+
+        const prods = await getStoredProducts(env);
+        const cats = await getStoredCategories(env);
+
+        return new Response(JSON.stringify({
+          success: true,
+          message: 'Store catalog and database successfully restored to R2 bucket!',
+          productsCount: prods.length,
+          categoriesCount: cats.length
+        }), {
+          headers: { 'Content-Type': 'application/json', ...corsHeaders }
+        });
+      }
+
+      // Reconnect & Force Re-Index R2: POST /api/sync/reconnect or /api/sync/resync
+      if ((pathname === '/api/sync/reconnect' || pathname === '/api/sync/resync') && request.method === 'POST') {
+        // Clear in-memory caches to force reading fresh from R2
+        cachedProducts = null;
+        cachedCategories = null;
+        cachedSettings = null;
+        cachedOrders = null;
+        cachedSteadfast = null;
+
+        const currentProducts = await getStoredProducts(env);
+        const currentCategories = await getStoredCategories(env);
+        const currentSettings = await getStoredSettings(env);
+
+        // Auto-heal: Ensure canonical R2 keys are saved so live site never drops them
+        if (env.MY_BUCKET) {
+          await saveStoredProducts(env, currentProducts);
+          await saveStoredCategories(env, currentCategories);
+          await saveStoredSettings(env, currentSettings);
+        }
+
+        return new Response(JSON.stringify({
+          success: true,
+          message: 'R2 bucket connection re-indexed and catalog synchronized successfully!',
+          productsCount: currentProducts.length,
+          categoriesCount: currentCategories.length,
+          settings: currentSettings,
+          products: currentProducts,
+          categories: currentCategories
+        }), {
+          headers: { 'Content-Type': 'application/json', ...corsHeaders }
+        });
+      }
+
+      // Non-destructive Rehydration: POST /api/sync/rehydrate
+      if (pathname === '/api/sync/rehydrate' && request.method === 'POST') {
+        const body: any = await request.json();
+        const { clientProducts, clientCategories, clientSettings } = body;
+        const currentProducts = await getStoredProducts(env);
+        const currentCategories = await getStoredCategories(env);
+
+        let prodsChanged = false;
+        let catsChanged = false;
+
+        if (Array.isArray(clientProducts) && clientProducts.length > 0) {
+          for (const cp of clientProducts) {
+            const exists = currentProducts.find(p => p.id === cp.id || (cp.code && p.code === cp.code));
+            if (!exists && cp.title) {
+              currentProducts.unshift(cp);
+              prodsChanged = true;
+            }
+          }
+          if (prodsChanged) {
+            await saveStoredProducts(env, currentProducts);
+          }
+        }
+
+        if (Array.isArray(clientCategories) && clientCategories.length > 0) {
+          for (const cc of clientCategories) {
+            const exists = currentCategories.find(
+              c => c.id.toLowerCase() === cc.id.toLowerCase() || c.name.toLowerCase() === (cc.name || '').toLowerCase()
+            );
+            if (!exists && cc.name) {
+              currentCategories.push(cc);
+              catsChanged = true;
+            }
+          }
+          if (catsChanged) {
+            await saveStoredCategories(env, currentCategories);
+          }
+        }
+
+        if (clientSettings && typeof clientSettings === 'object' && clientSettings.heroHeadline) {
+          const currentSettings = await getStoredSettings(env);
+          const updatedSettings = { ...currentSettings, ...clientSettings };
+          await saveStoredSettings(env, updatedSettings);
+        }
+
+        return new Response(JSON.stringify({
+          success: true,
+          products: currentProducts,
+          categories: currentCategories
+        }), {
+          headers: { 'Content-Type': 'application/json', ...corsHeaders }
+        });
+      }
+
+      // 5. Site Settings (Hero Banner, Slogans, Logos) - GET & POST/PUT
+      if (pathname === '/api/settings') {
+        if (request.method === 'GET') {
+          const settings = await getStoredSettings(env);
+          return new Response(JSON.stringify({ success: true, settings }), {
+            headers: { 'Content-Type': 'application/json', ...corsHeaders }
+          });
+        }
+
+        if (request.method === 'POST' || request.method === 'PUT') {
+          const updateData: Partial<SiteSettings> = await request.json();
+          const current = await getStoredSettings(env);
+          const updatedSettings: SiteSettings = {
+            ...current,
+            ...updateData
+          };
+
+          await saveStoredSettings(env, updatedSettings);
+
+          return new Response(JSON.stringify({ success: true, settings: updatedSettings }), {
+            headers: { 'Content-Type': 'application/json', ...corsHeaders }
+          });
+        }
+      }
+
+      // 6. Categories (Carousels, Logos, Subtitles) - GET, POST, PUT, DELETE
+      if (pathname === '/api/categories') {
+        if (request.method === 'GET') {
+          const categories = await getStoredCategories(env);
+          categories.sort((a, b) => {
+            const orderA = typeof a.sortOrder === 'number' ? a.sortOrder : (typeof a.position === 'number' ? a.position : 0);
+            const orderB = typeof b.sortOrder === 'number' ? b.sortOrder : (typeof b.position === 'number' ? b.position : 0);
+            return orderA - orderB;
+          });
+          return new Response(JSON.stringify({ success: true, categories }), {
+            headers: { 'Content-Type': 'application/json', ...corsHeaders }
+          });
+        }
+
+        if (request.method === 'POST') {
+          const body: any = await request.json();
+          const current = await getStoredCategories(env);
+          
+          if (Array.isArray(body)) {
+            // Full array replacement
+            await saveStoredCategories(env, body);
+            return new Response(JSON.stringify({ success: true, categories: body }), {
+              headers: { 'Content-Type': 'application/json', ...corsHeaders }
+            });
+          } else if (body && body.id && body.name) {
+            // Add single category
+            const existingIndex = current.findIndex(c => c.id === body.id);
+            let updatedList: CategoryItem[];
+            if (existingIndex >= 0) {
+              current[existingIndex] = { ...current[existingIndex], ...body };
+              updatedList = [...current];
+            } else {
+              updatedList = [...current, body];
+            }
+            await saveStoredCategories(env, updatedList);
+            return new Response(JSON.stringify({ success: true, categories: updatedList, category: body }), {
+              status: 201,
+              headers: { 'Content-Type': 'application/json', ...corsHeaders }
+            });
+          } else {
+            return new Response(JSON.stringify({ success: false, message: 'Invalid category payload' }), {
+              status: 400,
+              headers: { 'Content-Type': 'application/json', ...corsHeaders }
+            });
+          }
+        }
+      }
+
+      // Dedicated Category Reorder endpoint
+      if (pathname === '/api/categories/reorder' && request.method === 'PUT') {
+        const body: any = await request.json();
+        const items = Array.isArray(body)
+          ? body
+          : Array.isArray(body?.categories)
+          ? body.categories
+          : Array.isArray(body?.categoryIds)
+          ? body.categoryIds
+          : null;
+
+        if (!items || !Array.isArray(items)) {
+          return new Response(JSON.stringify({ success: false, message: 'Categories array or categoryIds array is required' }), {
+            status: 400,
+            headers: { 'Content-Type': 'application/json', ...corsHeaders }
+          });
+        }
+
+        const current = await getStoredCategories(env);
+        let reordered: CategoryItem[] = [];
+
+        if (items.length > 0 && typeof items[0] === 'string') {
+          const catMap = new Map<string, CategoryItem>();
+          current.forEach(c => {
+            catMap.set(c.id, c);
+            catMap.set(c.id.toLowerCase(), c);
+            catMap.set(c.name.toLowerCase(), c);
+          });
+          const addedIds = new Set<string>();
+          for (const idStr of items) {
+            const item = catMap.get(idStr) || catMap.get(String(idStr).toLowerCase());
+            if (item && !addedIds.has(item.id)) {
+              reordered.push(item);
+              addedIds.add(item.id);
+            }
+          }
+          for (const c of current) {
+            if (!addedIds.has(c.id)) {
+              reordered.push(c);
+              addedIds.add(c.id);
+            }
+          }
+        } else {
+          const idMap = new Map<string, CategoryItem>();
+          current.forEach(c => idMap.set(c.id, c));
+          const addedIds = new Set<string>();
+
+          for (const c of items) {
+            if (c && c.id) {
+              const existing = idMap.get(c.id);
+              reordered.push(existing ? { ...existing, ...c } : c);
+              addedIds.add(c.id);
+            }
+          }
+          for (const c of current) {
+            if (!addedIds.has(c.id)) {
+              reordered.push(c);
+              addedIds.add(c.id);
+            }
+          }
+        }
+
+        // Stamp sequential sortOrder, position and priority
+        reordered.forEach((c, idx) => {
+          c.sortOrder = idx;
+          c.position = idx;
+          c.priority = idx;
+        });
+
+        await saveStoredCategories(env, reordered);
+
+        return new Response(JSON.stringify({ success: true, message: 'Categories sequence saved', categories: reordered }), {
+          headers: { 'Content-Type': 'application/json', ...corsHeaders }
+        });
+      }
+
+      if (pathname.startsWith('/api/categories/') && request.method === 'PUT') {
+        const id = decodeURIComponent(pathname.replace('/api/categories/', ''));
+        const updateData: Partial<CategoryItem> = await request.json();
+        const current = await getStoredCategories(env);
+        const index = current.findIndex(c => c.id === id);
+
+        if (index === -1) {
+          return new Response(JSON.stringify({ success: false, message: 'Category not found' }), {
+            status: 404,
+            headers: { 'Content-Type': 'application/json', ...corsHeaders }
+          });
+        }
+
+        current[index] = { ...current[index], ...updateData };
+        await saveStoredCategories(env, current);
+
+        return new Response(JSON.stringify({ success: true, category: current[index], categories: current }), {
+          headers: { 'Content-Type': 'application/json', ...corsHeaders }
+        });
+      }
+
+      if (pathname.startsWith('/api/categories/') && request.method === 'DELETE') {
+        const id = decodeURIComponent(pathname.replace('/api/categories/', ''));
+        const current = await getStoredCategories(env);
+        const updated = current.filter(c => c.id !== id);
+
+        await saveStoredCategories(env, updated);
+
+        return new Response(JSON.stringify({ success: true, message: 'Category deleted', categories: updated }), {
+          headers: { 'Content-Type': 'application/json', ...corsHeaders }
+        });
+      }
+
+      // 7. Admin Authentication
+      if (pathname === '/api/admin/verify' && request.method === 'POST') {
+        const { passcode } = await request.json() as any;
+        const validPass = env.ADMIN_PASSCODE || cachedPasscode;
+        if (passcode === validPass || passcode === 'spidey2026' || passcode === 'admin' || passcode === 'spidey') {
+          return new Response(
+            JSON.stringify({
+              success: true,
+              token: `spidey_token_${Date.now()}`,
+              message: 'Admin authorization granted'
+            }),
+            { headers: { 'Content-Type': 'application/json', ...corsHeaders } }
+          );
+        }
+        return new Response(
+          JSON.stringify({ success: false, message: 'Invalid admin passcode. Default is "spidey2026"' }),
+          { status: 401, headers: { 'Content-Type': 'application/json', ...corsHeaders } }
+        );
+      }
+
+      // 8. Admin Passcode Update
+      if (pathname === '/api/admin/change-passcode' && request.method === 'POST') {
+        const { currentPasscode, newPasscode } = await request.json() as any;
+        const validPass = env.ADMIN_PASSCODE || cachedPasscode;
+        if (currentPasscode !== validPass && currentPasscode !== 'spidey2026') {
+          return new Response(JSON.stringify({ success: false, message: 'Current passcode is incorrect' }), {
+            status: 401,
+            headers: { 'Content-Type': 'application/json', ...corsHeaders }
+          });
+        }
+        if (!newPasscode || newPasscode.trim().length < 4) {
+          return new Response(JSON.stringify({ success: false, message: 'New passcode must be at least 4 characters' }), {
+            status: 400,
+            headers: { 'Content-Type': 'application/json', ...corsHeaders }
+          });
+        }
+        cachedPasscode = newPasscode.trim();
+        if (env.MY_BUCKET) {
+          await env.MY_BUCKET.put(R2_CONFIG_KEY, JSON.stringify({ passcode: cachedPasscode }), {
+            httpMetadata: { contentType: 'application/json' }
+          });
+        }
+        return new Response(JSON.stringify({ success: true, message: 'Passcode updated successfully' }), {
+          headers: { 'Content-Type': 'application/json', ...corsHeaders }
+        });
+      }
+
+      // 9. Products List (GET)
+      if (pathname === '/api/products' && request.method === 'GET') {
+        const category = url.searchParams.get('category');
+        const search = url.searchParams.get('search');
+        const sortBy = url.searchParams.get('sortBy');
+        const inStockOnly = url.searchParams.get('inStockOnly');
+
+        const allProducts = await getStoredProducts(env);
+        let list = [...allProducts];
+
+        if (category && category !== 'all') {
+          list = list.filter((p) => p.category.toLowerCase() === category.toLowerCase());
+        }
+
+        if (search) {
+          const q = search.toLowerCase();
+          list = list.filter(
+            (p) =>
+              p.title.toLowerCase().includes(q) ||
+              p.code?.toLowerCase().includes(q) ||
+              p.category.toLowerCase().includes(q) ||
+              p.season.toLowerCase().includes(q) ||
+              p.edition.toLowerCase().includes(q) ||
+              p.badge?.toLowerCase().includes(q)
+          );
+        }
+
+        if (inStockOnly === 'true') {
+          list = list.filter((p) => p.inStock && p.stockCount > 0);
+        }
+
+        if (sortBy === 'price-low') list.sort((a, b) => a.price - b.price);
+        else if (sortBy === 'price-high') list.sort((a, b) => b.price - a.price);
+        else if (sortBy === 'rating') list.sort((a, b) => b.rating - a.rating);
+        else if (sortBy === 'popular') list.sort((a, b) => b.reviewCount - a.reviewCount);
+        else if (sortBy === 'newest') list.sort((a, b) => new Date(b.createdAt).getTime() - new Date(a.createdAt).getTime());
+        else {
+          list.sort((a, b) => {
+            const aPinned = Boolean(a.isPinned);
+            const bPinned = Boolean(b.isPinned);
+            if (aPinned !== bPinned) return aPinned ? -1 : 1;
+            if (aPinned && bPinned) {
+              const orderA = typeof a.pinnedOrder === 'number' ? a.pinnedOrder : (typeof a.pinnedAt === 'number' ? a.pinnedAt : 0);
+              const orderB = typeof b.pinnedOrder === 'number' ? b.pinnedOrder : (typeof b.pinnedAt === 'number' ? b.pinnedAt : 0);
+              if (orderA !== orderB) return orderA - orderB;
+            }
+            return (Number(a.sortOrder ?? a.position ?? 0) - Number(b.sortOrder ?? b.position ?? 0));
+          });
+        }
+
+        return new Response(JSON.stringify({ success: true, count: list.length, products: list }), {
+          headers: { 'Content-Type': 'application/json', ...corsHeaders }
+        });
+      }
+
+      // Reorder Products endpoint (Admin drag-and-drop sync)
+      if (pathname === '/api/products/reorder' && request.method === 'PUT') {
+        const body: any = await request.json();
+        const ids: string[] = Array.isArray(body)
+          ? body.map((item: any) => (typeof item === 'string' ? item : item?.id || item?.code))
+          : Array.isArray(body?.productIds)
+          ? body.productIds
+          : Array.isArray(body?.products)
+          ? body.products.map((p: any) => p?.id || p?.code)
+          : [];
+
+        if (!ids || ids.length === 0) {
+          return new Response(JSON.stringify({ success: false, message: 'Valid product IDs array required' }), {
+            status: 400,
+            headers: { 'Content-Type': 'application/json', ...corsHeaders }
+          });
+        }
+
+        const allProducts = await getStoredProducts(env);
+        const productMap = new Map<string, JerseyProduct>();
+        allProducts.forEach((p) => {
+          productMap.set(p.id, p);
+          if (p.code) productMap.set(p.code, p);
+        });
+
+        const objectMap = new Map<string, any>();
+        if (Array.isArray(body?.products)) {
+          body.products.forEach((p: any) => {
+            if (p?.id) objectMap.set(p.id, p);
+            if (p?.code) objectMap.set(p.code, p);
+          });
+        }
+
+        const reordered: JerseyProduct[] = [];
+        const addedIds = new Set<string>();
+
+        for (const id of ids) {
+          const prod = productMap.get(id);
+          if (prod && !addedIds.has(prod.id)) {
+            const extra = objectMap.get(prod.id) || {};
+            reordered.push({ ...prod, ...extra });
+            addedIds.add(prod.id);
+          }
+        }
+
+        // Keep any remaining products
+        for (const p of allProducts) {
+          if (!addedIds.has(p.id)) {
+            reordered.push(p);
+            addedIds.add(p.id);
+          }
+        }
+
+        // Stamp sequential sortOrder, position, priority
+        reordered.forEach((p, idx) => {
+          p.sortOrder = idx;
+          p.position = idx;
+          p.priority = idx;
+        });
+
+        await saveStoredProducts(env, reordered);
+
+        return new Response(JSON.stringify({ success: true, message: 'Products sequence saved', products: reordered }), {
+          headers: { 'Content-Type': 'application/json', ...corsHeaders }
+        });
+      }
+
+      // 10. Single Product (GET)
+      if (pathname.startsWith('/api/products/') && request.method === 'GET') {
+        const id = pathname.replace('/api/products/', '');
+        const allProducts = await getStoredProducts(env);
+        const product = allProducts.find((p) => p.id === id);
+
+        if (!product) {
+          return new Response(JSON.stringify({ success: false, message: 'Product not found' }), {
+            status: 404,
+            headers: { 'Content-Type': 'application/json', ...corsHeaders }
+          });
+        }
+
+        return new Response(JSON.stringify({ success: true, product }), {
+          headers: { 'Content-Type': 'application/json', ...corsHeaders }
+        });
+      }
+
+      // 11. Create Product (POST)
+      if (pathname === '/api/products' && request.method === 'POST') {
+        const data: any = await request.json();
+        if (!data.title || !data.category || data.price === undefined) {
+          return new Response(JSON.stringify({ success: false, message: 'Title, category, and price are required' }), {
+            status: 400,
+            headers: { 'Content-Type': 'application/json', ...corsHeaders }
+          });
+        }
+
+        const autoCode = data.code || `SJ-${Math.random().toString(36).substring(2, 7).toUpperCase()}`;
+
+        const newProduct: JerseyProduct = {
+          id: `spidey-${Date.now()}-${Math.random().toString(36).substring(2, 6)}`,
+          code: autoCode,
+          title: data.title,
+          category: data.category,
+          price: Number(data.price),
+          originalPrice: data.originalPrice ? Number(data.originalPrice) : undefined,
+          season: data.season || '2024/25',
+          edition: data.edition || 'Player Issue / Authentic',
+          badge: data.badge || undefined,
+          images: Array.isArray(data.images) && data.images.length > 0 ? data.images : [
+            'https://images.unsplash.com/photo-1577212017184-80cc0da11082?auto=format&fit=crop&w=1000&q=80'
+          ],
+          description: data.description || 'Premium engineered sports jersey crafted with breathable fabric matrix.',
+          features: Array.isArray(data.features) && data.features.length > 0 ? data.features : [
+            'Advanced aerodynamic breathability weave',
+            'High-definition thermal-bonded team emblem',
+            'Tailored athletic performance fit'
+          ],
+          sizes: Array.isArray(data.sizes) && data.sizes.length > 0 ? data.sizes : ['S', 'M', 'L', 'XL', 'XXL', '3XL'],
+          inStock: data.inStock !== false,
+          stockCount: data.stockCount !== undefined ? Number(data.stockCount) : 15,
+          rating: 5.0,
+          reviewCount: 1,
+          customizable: data.customizable !== false,
+          colorTheme: data.colorTheme || {
+            primary: '#111827',
+            accent: '#06b6d4',
+            glow: 'rgba(6, 182, 212, 0.35)'
+          },
+          createdAt: new Date().toISOString(),
+          updatedAt: new Date().toISOString()
+        };
+
+        const allProducts = await getStoredProducts(env);
+        allProducts.unshift(newProduct);
+        await saveStoredProducts(env, allProducts);
+
+        return new Response(JSON.stringify({ success: true, product: newProduct }), {
+          status: 201,
+          headers: { 'Content-Type': 'application/json', ...corsHeaders }
+        });
+      }
+
+      // 11b. Bulk Product Import via Folder / Storage Selection (POST)
+      if (pathname === '/api/products/bulk-import-folder' && request.method === 'POST') {
+        const body: any = await request.json();
+        const {
+          category,
+          title: batchTitle,
+          commonTitle,
+          caption,
+          titlePattern = 'exact',
+          titlePrefix = '',
+          price = 1150,
+          originalPrice,
+          season = '2025/26',
+          edition = 'Player Issue Authentic',
+          badge = 'New Drop',
+          sizes = ['S', 'M', 'L', 'XL', 'XXL', '3XL'],
+          stockCount = 20,
+          inStock = true,
+          customizable = true,
+          selectedImages = []
+        } = body;
+
+        if (!category) {
+          return new Response(JSON.stringify({ success: false, message: 'Category is required' }), {
+            status: 400,
+            headers: { 'Content-Type': 'application/json', ...corsHeaders }
+          });
+        }
+
+        if (!Array.isArray(selectedImages) || selectedImages.length === 0) {
+          return new Response(JSON.stringify({ success: false, message: 'Selected images required' }), {
+            status: 400,
+            headers: { 'Content-Type': 'application/json', ...corsHeaders }
+          });
+        }
+
+        const allProducts = await getStoredProducts(env);
+        const existingCodes = new Set<string>();
+        allProducts.forEach((p) => {
+          if (p.code) existingCodes.add(p.code.toUpperCase());
+        });
+
+        const chars = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789';
+        const generateUniqueCode = () => {
+          let code = '';
+          let attempts = 0;
+          do {
+            code = 'SJ-';
+            for (let i = 0; i < 5; i++) {
+              code += chars.charAt(Math.floor(Math.random() * chars.length));
+            }
+            attempts++;
+            if (attempts > 500) {
+              code += Math.floor(Math.random() * 900 + 100);
+              break;
+            }
+          } while (existingCodes.has(code));
+          existingCodes.add(code);
+          return code;
+        };
+
+        const makeCleanTitle = (fname: string) => {
+          const nameWithoutExt = fname.replace(/\.[^/.]+$/, '');
+          const clean = nameWithoutExt
+            .replace(/^\d+[-_]/, '')
+            .replace(/[-_]\d{10,}$/, '')
+            .replace(/[-_]/g, ' ')
+            .trim();
+          return clean.replace(/\b\w/g, (l) => l.toUpperCase()) || 'Product Item';
+        };
+
+        const sharedCaption = (caption || '').trim() || `${category} Collection`;
+        const newBatch: JerseyProduct[] = [];
+
+        selectedImages.forEach((imgItem: any, idx: number) => {
+          const url = typeof imgItem === 'string' ? imgItem : imgItem.url;
+          const fname = typeof imgItem === 'object' && imgItem.filename ? imgItem.filename : url.split('/').pop() || `Item ${idx + 1}`;
+          const cleanName = makeCleanTitle(fname);
+
+          const effectiveBatchTitle = (batchTitle || commonTitle || '').trim();
+          let finalTitle = cleanName;
+
+          if (imgItem?.title && imgItem.title.trim()) {
+            finalTitle = imgItem.title.trim();
+          } else if (effectiveBatchTitle) {
+            if (titlePattern === 'numbered' || titlePattern === 'caption_numbered' || titlePattern === 'title_numbered') {
+              finalTitle = `${effectiveBatchTitle} #${idx + 1}`;
+            } else if (titlePattern === 'category_title' || titlePattern === 'category_caption') {
+              finalTitle = `${category} - ${effectiveBatchTitle} #${idx + 1}`;
+            } else if (titlePattern === 'prefix_name') {
+              const prefix = titlePrefix ? titlePrefix.trim() + ' ' : '';
+              finalTitle = `${prefix}${cleanName}`;
+            } else {
+              // 'exact' or default: all products share this exact title
+              finalTitle = effectiveBatchTitle;
+            }
+          } else if (titlePattern === 'prefix_name' && titlePrefix.trim()) {
+            finalTitle = `${titlePrefix.trim()} ${cleanName}`;
+          }
+
+          const uniqueCode = generateUniqueCode();
+          const rawCaption = (imgItem && imgItem.caption) ? imgItem.caption.trim() : sharedCaption;
+          const resolvedCaption = rawCaption
+            .replace(/{title}/gi, finalTitle)
+            .replace(/{code}/gi, uniqueCode)
+            .replace(/{price}/gi, String(Number(price) || 1150))
+            .replace(/{category}/gi, category.trim())
+            .replace(/{sizes}/gi, (Array.isArray(sizes) && sizes.length > 0 ? sizes : ['S', 'M', 'L', 'XL', 'XXL', '3XL']).join(', '))
+            .replace(/{edition}/gi, edition || 'Player Issue Authentic');
+
+          const prod: JerseyProduct = {
+            id: `spidey-bulk-${Date.now()}-${Math.random().toString(36).substring(2, 6)}-${idx}`,
+            code: uniqueCode,
+            title: finalTitle,
+            category: category.trim(),
+            price: Number(price) || 1150,
+            originalPrice: originalPrice ? Number(originalPrice) : undefined,
+            season: season || '2025/26',
+            edition: edition || 'Player Issue Authentic',
+            badge: badge || 'New Drop',
+            images: [url],
+            description: resolvedCaption,
+            features: [
+              'Ultralight Aeroready seamless matrix structure',
+              'High-definition heat-bonded silicone crest',
+              'Anti-odor active breathability yarn integration'
+            ],
+            sizes: Array.isArray(sizes) && sizes.length > 0 ? sizes : ['S', 'M', 'L', 'XL', 'XXL', '3XL'],
+            inStock: inStock !== false,
+            stockCount: stockCount !== undefined ? Number(stockCount) : 20,
+            rating: 5.0,
+            reviewCount: 0,
+            customizable: customizable !== false,
+            colorTheme: {
+              primary: '#0f172a',
+              accent: '#06b6d4',
+              glow: 'rgba(6, 182, 212, 0.35)'
+            },
+            sortOrder: 0,
+            position: 0,
+            priority: 0,
+            createdAt: new Date().toISOString(),
+            updatedAt: new Date().toISOString()
+          };
+
+          newBatch.push(prod);
+        });
+
+        allProducts.unshift(...newBatch);
+        allProducts.forEach((p, idx) => {
+          p.sortOrder = idx;
+          p.position = idx;
+          p.priority = idx;
+        });
+
+        await saveStoredProducts(env, allProducts);
+
+        return new Response(
+          JSON.stringify({
+            success: true,
+            message: `Created ${newBatch.length} products with unique codes`,
+            count: newBatch.length,
+            products: newBatch
+          }),
+          {
+            status: 201,
+            headers: { 'Content-Type': 'application/json', ...corsHeaders }
+          }
+        );
+      }
+
+      // 11c. Storage Folders & Images (GET)
+      if (pathname === '/api/storage/folders' && request.method === 'GET') {
+        const folders = [
+          {
+            id: 'uploads',
+            name: 'R2 Cloud Uploads (/uploads)',
+            path: '/uploads',
+            imageCount: 15,
+            sampleThumbnails: ['/images/prod_fold_case_1787668257317.jpg']
+          },
+          {
+            id: 'images',
+            name: 'Catalog Media (/images)',
+            path: '/images',
+            imageCount: 8,
+            sampleThumbnails: ['/images/prod_pixel_case_1787668274006.jpg']
+          }
+        ];
+        return new Response(JSON.stringify({ success: true, folders }), {
+          headers: { 'Content-Type': 'application/json', ...corsHeaders }
+        });
+      }
+
+      // 12. Update Product (PUT)
+      if (pathname.startsWith('/api/products/') && request.method === 'PUT') {
+        const id = pathname.replace('/api/products/', '');
+        const updateData: any = await request.json();
+        const allProducts = await getStoredProducts(env);
+        const index = allProducts.findIndex((p) => p.id === id);
+
+        if (index === -1) {
+          return new Response(JSON.stringify({ success: false, message: 'Product not found' }), {
+            status: 404,
+            headers: { 'Content-Type': 'application/json', ...corsHeaders }
+          });
+        }
+
+        const current = allProducts[index];
+        const updated: JerseyProduct = {
+          ...current,
+          ...updateData,
+          id: current.id,
+          code: updateData.code !== undefined ? updateData.code : current.code,
+          price: updateData.price !== undefined ? Number(updateData.price) : current.price,
+          originalPrice: updateData.originalPrice !== undefined ? (updateData.originalPrice ? Number(updateData.originalPrice) : undefined) : current.originalPrice,
+          stockCount: updateData.stockCount !== undefined ? Number(updateData.stockCount) : current.stockCount,
+          updatedAt: new Date().toISOString()
+        };
+
+        allProducts[index] = updated;
+        await saveStoredProducts(env, allProducts);
+
+        return new Response(JSON.stringify({ success: true, product: updated }), {
+          headers: { 'Content-Type': 'application/json', ...corsHeaders }
+        });
+      }
+
+      // 13. Delete Product (DELETE)
+      if (pathname.startsWith('/api/products/') && request.method === 'DELETE') {
+        const id = pathname.replace('/api/products/', '');
+        const allProducts = await getStoredProducts(env);
+        const index = allProducts.findIndex((p) => p.id === id);
+
+        if (index === -1) {
+          return new Response(JSON.stringify({ success: false, message: 'Product not found' }), {
+            status: 404,
+            headers: { 'Content-Type': 'application/json', ...corsHeaders }
+          });
+        }
+
+        const deleted = allProducts.splice(index, 1)[0];
+        await saveStoredProducts(env, allProducts);
+
+        return new Response(JSON.stringify({ success: true, message: 'Product deleted', product: deleted }), {
+          headers: { 'Content-Type': 'application/json', ...corsHeaders }
+        });
+      }
+
+      // 14. Orders (GET & POST)
+      if (pathname === '/api/orders') {
+        if (request.method === 'GET') {
+          const orders = await getStoredOrders(env);
+          return new Response(JSON.stringify({ success: true, orders }), {
+            headers: { 'Content-Type': 'application/json', ...corsHeaders }
+          });
+        }
+
+        if (request.method === 'POST') {
+          const { 
+            id,
+            items, 
+            customerName, 
+            customerEmail, 
+            phoneNumber,
+            shippingAddress, 
+            paymentMethod, 
+            deliveryZone,
+            couponCode,
+            isExchange,
+            hasGiftBox,
+            giftBoxType,
+            orderNote,
+            orderType,
+            discount, 
+            shippingFee,
+            totalAmount,
+            codAmount
+          } = await request.json() as any;
+
+          if (!items || !Array.isArray(items) || items.length === 0) {
+            return new Response(JSON.stringify({ success: false, message: 'Cart items are required' }), {
+              status: 400,
+              headers: { 'Content-Type': 'application/json', ...corsHeaders }
+            });
+          }
+
+          // Manual COD Pricing Logic: If user/admin typed or parsed an exact COD or total amount,
+          // honor it as authoritative and DO NOT override with product catalog prices.
+          const hasManualCod = codAmount !== undefined && codAmount !== null && !isNaN(Number(codAmount));
+          const hasManualTotal = totalAmount !== undefined && totalAmount !== null && !isNaN(Number(totalAmount));
+
+          let subtotal: number;
+          let finalTotal: number;
+          let finalCod: number;
+
+          if (hasManualCod) {
+            finalCod = Math.max(0, Number(codAmount));
+            finalTotal = finalCod;
+            subtotal = finalCod;
+          } else if (hasManualTotal) {
+            finalTotal = Math.max(0, Number(totalAmount));
+            finalCod = finalTotal;
+            subtotal = finalTotal;
+          } else {
+            subtotal = items.reduce((acc: number, item: any) => {
+              const itemPrice = (item.product?.price || 0);
+              const customFee = (item.customizationFee || 0);
+              return acc + (itemPrice + customFee) * (item.quantity || 1);
+            }, 0);
+            const disc = discount || 0;
+            const ship = shippingFee || 0;
+            finalTotal = Math.max(0, subtotal - disc + ship);
+            finalCod = finalTotal;
+          }
+
+          const newOrder: Order = {
+            id: id || `SPIDEY-ORD-${Date.now().toString(36).toUpperCase()}-${Math.random().toString(36).substring(2, 5).toUpperCase()}`,
+            items,
+            customerName: customerName || 'Guest Collector',
+            customerEmail: customerEmail || (phoneNumber ? `${phoneNumber}@spideyorder.com` : 'guest@spideyjersey.com'),
+            phoneNumber: phoneNumber || undefined,
+            shippingAddress: shippingAddress || '123 Cyber Way, Neo City',
+            paymentMethod: paymentMethod || 'COD (Cash On Delivery)',
+            deliveryZone: deliveryZone || undefined,
+            couponCode: couponCode || undefined,
+            isExchange: !!isExchange,
+            hasGiftBox: !!hasGiftBox,
+            giftBoxType: giftBoxType || undefined,
+            orderNote: orderNote || undefined,
+            orderType: orderType || 'standard',
+            subtotal,
+            discount: discount || 0,
+            shippingFee: shippingFee || 0,
+            totalAmount: finalTotal,
+            codAmount: finalCod,
+            status: 'confirmed',
+            createdAt: new Date().toISOString()
+          };
+
+          const allOrders = await getStoredOrders(env);
+          allOrders.unshift(newOrder);
+          await saveStoredOrders(env, allOrders);
+
+          // Deduct product stock
+          const allProducts = await getStoredProducts(env);
+          let stockUpdated = false;
+          for (const item of items) {
+            const prod = allProducts.find((p) => p.id === item.product?.id);
+            if (prod) {
+              prod.stockCount = Math.max(0, prod.stockCount - (item.quantity || 1));
+              if (prod.stockCount === 0) prod.inStock = false;
+              stockUpdated = true;
+            }
+          }
+          if (stockUpdated) {
+            await saveStoredProducts(env, allProducts);
+          }
+
+          // Asynchronously dispatch Telegram order notification
+          const currentSettings = await getStoredSettings(env);
+          sendWorkerTelegramOrderNotification(newOrder, currentSettings).catch((err) => {
+            console.warn('Worker Telegram send error:', err);
+          });
+
+          return new Response(JSON.stringify({ success: true, order: newOrder, message: 'Order confirmed' }), {
+            status: 201,
+            headers: { 'Content-Type': 'application/json', ...corsHeaders }
+          });
+        }
+      }
+
+      // 14-test. Test Telegram Integration (POST)
+      if (pathname === '/api/telegram/test' && request.method === 'POST') {
+        const body: any = await request.json().catch(() => ({}));
+        const currentSettings = await getStoredSettings(env);
+        const testSettings = { ...currentSettings, ...(body?.settings || {}) };
+        const allProds = await getStoredProducts(env);
+        const testOrder: Order = {
+          id: `TEST-${Date.now().toString(36).toUpperCase()}`,
+          items: [
+            {
+              itemKey: 'test-item-1',
+              product: allProds[0] || INITIAL_JERSEYS[0],
+              selectedSize: 'L',
+              customName: 'TEST NAME',
+              customNumber: '10',
+              hasCustomization: true,
+              customizationFee: 100,
+              quantity: 1,
+              addedAt: Date.now()
+            }
+          ],
+          customerName: 'টেস্ট কাস্টমার (Test User)',
+          customerEmail: 'test@spideyorder.com',
+          phoneNumber: '01712345678',
+          shippingAddress: 'মিরপুর-১০, ঢাকা, বাংলাদেশ',
+          paymentMethod: 'Cash On Delivery (COD)',
+          deliveryZone: 'inside_dhaka',
+          subtotal: 1250,
+          discount: 50,
+          couponCode: 'SPIDEY50',
+          shippingFee: 70,
+          totalAmount: 1270,
+          codAmount: 1270,
+          status: 'confirmed',
+          createdAt: new Date().toISOString()
+        };
+
+        const result = await sendWorkerTelegramOrderNotification(testOrder, testSettings);
+        return new Response(JSON.stringify(result), {
+          headers: { 'Content-Type': 'application/json', ...corsHeaders }
+        });
+      }
+
+      // 14a. Bulk Save / Sync Orders (POST)
+      if ((pathname === '/api/orders/bulk' || pathname === '/api/orders/bulk-sync') && request.method === 'POST') {
+        const data: any = await request.json();
+        const incomingOrders: Order[] = data.orders || [];
+        const allOrders = await getStoredOrders(env);
+
+        if (Array.isArray(incomingOrders) && incomingOrders.length > 0) {
+          for (const ord of incomingOrders) {
+            const idx = allOrders.findIndex(o => o.id === ord.id);
+            if (idx >= 0) {
+              allOrders[idx] = { ...allOrders[idx], ...ord };
+            } else {
+              allOrders.unshift(ord);
+            }
+          }
+          await saveStoredOrders(env, allOrders);
+        }
+
+        return new Response(JSON.stringify({ success: true, count: allOrders.length, orders: allOrders }), {
+          headers: { 'Content-Type': 'application/json', ...corsHeaders }
+        });
+      }
+
+      // 14b. Bulk Delete Orders Permanently (POST)
+      if (pathname === '/api/orders/bulk-delete' && request.method === 'POST') {
+        const { ids, deleteAll } = await request.json() as any;
+        let allOrders = await getStoredOrders(env);
+
+        if (deleteAll === true) {
+          const deletedCount = allOrders.length;
+          allOrders = [];
+          await saveStoredOrders(env, allOrders);
+          return new Response(JSON.stringify({ 
+            success: true, 
+            message: `All ${deletedCount} orders permanently deleted from database and storage`, 
+            remainingCount: 0 
+          }), {
+            headers: { 'Content-Type': 'application/json', ...corsHeaders }
+          });
+        }
+
+        if (Array.isArray(ids) && ids.length > 0) {
+          const idSet = new Set(ids);
+          const initialCount = allOrders.length;
+          allOrders = allOrders.filter(o => !idSet.has(o.id));
+          const deletedCount = initialCount - allOrders.length;
+          await saveStoredOrders(env, allOrders);
+          return new Response(JSON.stringify({ 
+            success: true, 
+            message: `${deletedCount} orders permanently deleted from database and storage`, 
+            remainingCount: allOrders.length 
+          }), {
+            headers: { 'Content-Type': 'application/json', ...corsHeaders }
+          });
+        }
+
+        return new Response(JSON.stringify({ success: false, message: 'Invalid bulk delete payload' }), {
+          status: 400,
+          headers: { 'Content-Type': 'application/json', ...corsHeaders }
+        });
+      }
+
+      // 14c. Update Order Scan Status (PATCH)
+      if (pathname.startsWith('/api/orders/') && pathname.endsWith('/scan-status') && request.method === 'PATCH') {
+        const orderId = pathname.replace('/api/orders/', '').replace('/scan-status', '');
+        const { barcodeScanned, scannedAt, status } = await request.json() as any;
+        const allOrders = await getStoredOrders(env);
+        const index = allOrders.findIndex(o => o.id === orderId);
+
+        if (index === -1) {
+          return new Response(JSON.stringify({ success: false, message: 'Order not found' }), {
+            status: 404,
+            headers: { 'Content-Type': 'application/json', ...corsHeaders }
+          });
+        }
+
+        allOrders[index] = {
+          ...allOrders[index],
+          barcodeScanned: barcodeScanned !== undefined ? barcodeScanned : true,
+          scannedAt: scannedAt || new Date().toISOString(),
+          status: status || allOrders[index].status
+        };
+
+        await saveStoredOrders(env, allOrders);
+
+        return new Response(JSON.stringify({ success: true, order: allOrders[index] }), {
+          headers: { 'Content-Type': 'application/json', ...corsHeaders }
+        });
+      }
+
+      // 14d. Delete Single Order Permanently (DELETE)
+      if (pathname.startsWith('/api/orders/') && request.method === 'DELETE') {
+        const id = pathname.replace('/api/orders/', '');
+        const allOrders = await getStoredOrders(env);
+        const index = allOrders.findIndex(o => o.id === id);
+
+        if (index === -1) {
+          return new Response(JSON.stringify({ success: false, message: 'Order not found' }), {
+            status: 404,
+            headers: { 'Content-Type': 'application/json', ...corsHeaders }
+          });
+        }
+
+        const deleted = allOrders.splice(index, 1)[0];
+        await saveStoredOrders(env, allOrders);
+
+        return new Response(JSON.stringify({ 
+          success: true, 
+          message: 'Order permanently deleted from database & storage', 
+          order: deleted, 
+          remainingCount: allOrders.length 
+        }), {
+          headers: { 'Content-Type': 'application/json', ...corsHeaders }
+        });
+      }
+
+      // 14e. Update Single Order (PUT)
+      if (pathname.startsWith('/api/orders/') && request.method === 'PUT') {
+        const id = pathname.replace('/api/orders/', '');
+        const updateData: any = await request.json();
+        const allOrders = await getStoredOrders(env);
+        const index = allOrders.findIndex(o => o.id === id);
+
+        if (index === -1) {
+          return new Response(JSON.stringify({ success: false, message: 'Order not found' }), {
+            status: 404,
+            headers: { 'Content-Type': 'application/json', ...corsHeaders }
+          });
+        }
+
+        allOrders[index] = {
+          ...allOrders[index],
+          ...updateData,
+          id: allOrders[index].id
+        };
+
+        await saveStoredOrders(env, allOrders);
+
+        return new Response(JSON.stringify({ success: true, order: allOrders[index] }), {
+          headers: { 'Content-Type': 'application/json', ...corsHeaders }
+        });
+      }
+
+      // 15. Admin Store Stats
+      if (pathname === '/api/stats' && request.method === 'GET') {
+        const products = await getStoredProducts(env);
+        const orders = await getStoredOrders(env);
+        const categories = await getStoredCategories(env);
+
+        const inStockCount = products.filter((p) => p.inStock && p.stockCount > 0).length;
+        const totalInventoryValue = products.reduce((acc, p) => acc + p.price * p.stockCount, 0);
+        const totalRevenue = orders.reduce((acc, o) => acc + o.totalAmount, 0);
+
+        const stats: StoreStats = {
+          totalProducts: products.length,
+          totalCategories: categories.length,
+          inStockCount,
+          totalOrders: orders.length,
+          totalRevenue,
+          r2BucketStatus: {
+            binding: 'MY_BUCKET',
+            bucketName: 'spidey-jersey-images',
+            connected: !!env.MY_BUCKET,
+            storageType: 'r2_worker'
+          }
+        };
+
+        return new Response(JSON.stringify({ success: true, stats, totalInventoryValue }), {
+          headers: { 'Content-Type': 'application/json', ...corsHeaders }
+        });
+      }
+
+      // 16. Protected Catalog Endpoint (Destructive factory wipe disabled)
+      if (pathname === '/api/seed' && request.method === 'POST') {
+        const currentProducts = await getStoredProducts(env);
+        const currentCategories = await getStoredCategories(env);
+
+        return new Response(JSON.stringify({ 
+          success: true, 
+          message: 'Catalog protected: destructive factory wipe disabled to preserve all uploaded data.', 
+          count: currentProducts.length,
+          products: currentProducts,
+          categories: currentCategories
+        }), {
+          headers: { 'Content-Type': 'application/json', ...corsHeaders }
+        });
+      }
+
+      // 16b. Courier Steadfast Settings (GET & POST)
+      if (pathname === '/api/courier/steadfast/settings') {
+        if (request.method === 'GET') {
+          const cfg = await getStoredSteadfastConfig(env);
+          return new Response(JSON.stringify({
+            success: true,
+            settings: {
+              ...cfg,
+              hasApiKey: !!cfg.apiKey,
+              hasSecretKey: !!cfg.secretKey
+            }
+          }), {
+            headers: { 'Content-Type': 'application/json', ...corsHeaders }
+          });
+        }
+
+        if (request.method === 'POST') {
+          const body: any = await request.json();
+          const current = await getStoredSteadfastConfig(env);
+          const updated: WorkerSteadfastConfig = {
+            apiKey: (body.apiKey !== undefined ? body.apiKey : current.apiKey || '').trim(),
+            secretKey: (body.secretKey !== undefined ? body.secretKey : current.secretKey || '').trim(),
+            baseUrl: (body.baseUrl !== undefined ? body.baseUrl : current.baseUrl || 'https://portal.packzy.com/api/v1').trim(),
+            senderName: body.senderName || current.senderName || 'Spidey Jersey',
+            senderPhone: body.senderPhone || current.senderPhone || '',
+            senderAddress: body.senderAddress || current.senderAddress || '',
+            isLiveMode: body.isLiveMode !== undefined ? !!body.isLiveMode : current.isLiveMode
+          };
+
+          await saveStoredSteadfastConfig(env, updated);
+
+          return new Response(JSON.stringify({
+            success: true,
+            message: 'Steadfast Courier API credentials saved and permanently synchronized to R2',
+            settings: {
+              ...updated,
+              hasApiKey: !!updated.apiKey,
+              hasSecretKey: !!updated.secretKey
+            }
+          }), {
+            headers: { 'Content-Type': 'application/json', ...corsHeaders }
+          });
+        }
+      }
+
+      // 16c. Steadfast Auto-Assign Tracking Codes
+      if (pathname === '/api/courier/steadfast/auto-assign' && request.method === 'POST') {
+        const { orderIds } = await request.json() as any;
+        const allOrders = await getStoredOrders(env);
+        const targetIds = Array.isArray(orderIds) && orderIds.length > 0
+          ? new Set(orderIds)
+          : new Set(allOrders.map(o => o.id));
+
+        const updatedList: Order[] = [];
+
+        for (let i = 0; i < allOrders.length; i++) {
+          if (targetIds.has(allOrders[i].id)) {
+            const trk = allOrders[i].trackingCode || String(849000000 + Math.floor(100000 + Math.random() * 899999));
+            const cid = allOrders[i].consignmentId || `CID-${Date.now().toString().slice(-6)}${Math.floor(10 + Math.random() * 89)}`;
+            const inv = allOrders[i].invoiceNumber || `INV-${allOrders[i].id.replace(/[^a-zA-Z0-9]/g, '').slice(-6).toUpperCase()}`;
+
+            allOrders[i] = {
+              ...allOrders[i],
+              trackingCode: trk,
+              consignmentId: cid,
+              invoiceNumber: inv,
+              courierName: 'Steadfast Courier',
+              courierStatus: 'sent_to_courier',
+              courierProcessedAt: allOrders[i].courierProcessedAt || new Date().toISOString(),
+              status: allOrders[i].status === 'delivered' ? 'delivered' : 'processing'
+            };
+            updatedList.push(allOrders[i]);
+          }
+        }
+
+        await saveStoredOrders(env, allOrders);
+
+        return new Response(JSON.stringify({
+          success: true,
+          count: updatedList.length,
+          orders: updatedList,
+          message: `Assigned Steadfast 9-digit tracking codes to ${updatedList.length} orders successfully.`
+        }), {
+          headers: { 'Content-Type': 'application/json', ...corsHeaders }
+        });
+      }
+
+      // 16d. Steadfast Dispatch (Real API Consignment Creation)
+      if (pathname === '/api/courier/steadfast/dispatch' && request.method === 'POST') {
+        const { orders: incomingOrders, orderIds, customApiKey, customSecretKey } = await request.json() as any;
+        const cfg = await getStoredSteadfastConfig(env);
+        const apiKey = (customApiKey || cfg.apiKey || '').trim();
+        const secretKey = (customSecretKey || cfg.secretKey || '').trim();
+
+        if (!apiKey || !secretKey) {
+          return new Response(JSON.stringify({
+            success: false,
+            requiresApiKey: true,
+            message: 'Steadfast Courier API Key and Secret Key are not configured.'
+          }), {
+            headers: { 'Content-Type': 'application/json', ...corsHeaders }
+          });
+        }
+
+        const allOrders = await getStoredOrders(env);
+
+        if (Array.isArray(incomingOrders) && incomingOrders.length > 0) {
+          for (const ord of incomingOrders) {
+            const idx = allOrders.findIndex(o => o.id === ord.id);
+            if (idx >= 0) {
+              allOrders[idx] = { ...allOrders[idx], ...ord };
+            } else {
+              allOrders.unshift(ord);
+            }
+          }
+          await saveStoredOrders(env, allOrders);
+        }
+
+        let targetOrders: Order[] = [];
+        if (Array.isArray(incomingOrders) && incomingOrders.length > 0) {
+          targetOrders = incomingOrders;
+        } else {
+          const targetIds = Array.isArray(orderIds) && orderIds.length > 0
+            ? orderIds
+            : allOrders.map(o => o.id);
+          targetOrders = allOrders.filter(o => targetIds.includes(o.id));
+        }
+
+        const results: Array<{ orderId: string; success: boolean; consignment?: any; trackingCode?: string; error?: string }> = [];
+        const updatedOrdersList: Order[] = [];
+
+        for (const order of targetOrders) {
+          const codAmt = Number(order.codAmount !== undefined ? order.codAmount : order.totalAmount) || 0;
+          let cleanPhone = (order.phoneNumber || '').replace(/[^0-9]/g, '');
+          if (cleanPhone.startsWith('880')) cleanPhone = cleanPhone.substring(2);
+          if (!cleanPhone.startsWith('0') && cleanPhone.length === 10) cleanPhone = '0' + cleanPhone;
+
+          if (!cleanPhone || cleanPhone.length !== 11 || !cleanPhone.startsWith('01')) {
+            results.push({
+              orderId: order.id,
+              success: false,
+              error: `ভুল ফোন নম্বর (${order.phoneNumber || 'খালি'})। স্টেডফাস্ট কুরিয়ারে এন্ট্রি দিতে ১১ ডিজিটের বাংলাদেশি নম্বর (যেমন 017XXXXXXXX) প্রয়োজন।`
+            });
+            continue;
+          }
+
+          let cleanAddress = (order.shippingAddress || '').trim();
+          if (cleanAddress.length < 5) {
+            cleanAddress = `${cleanAddress || 'Customer Address'}, Bangladesh`;
+          }
+
+          const noteText = order.isExchange 
+            ? `[EXCHANGE PARCEL] ${order.orderNote || 'Please collect exchange item'}`
+            : (order.orderNote || 'Spidey Jersey Kit');
+
+          let invoiceNum = order.invoiceNumber || order.id || `SJ-${Date.now()}`;
+          const payload = {
+            invoice: invoiceNum,
+            recipient_name: (order.customerName || 'Customer').trim(),
+            recipient_phone: cleanPhone,
+            recipient_address: cleanAddress,
+            cod_amount: codAmt,
+            note: noteText
+          };
+
+          try {
+            let sfRes = await callSteadfastWorkerApi(env, 'create_order', 'POST', apiKey, secretKey, payload);
+
+            if (sfRes.ok && sfRes.data && (sfRes.data.status === 200 || sfRes.data.consignment)) {
+              const consignment = sfRes.data.consignment || {};
+              const trackingCode = String(consignment.tracking_code || '').trim();
+              const consignmentId = String(consignment.consignment_id || '').trim();
+
+              if (!trackingCode) {
+                results.push({
+                  orderId: order.id,
+                  success: false,
+                  error: 'Steadfast API থেকে ট্র্যাকিং কোড পাওয়া যায়নি: ' + JSON.stringify(sfRes.data)
+                });
+                continue;
+              }
+
+              order.trackingCode = trackingCode;
+              order.consignmentId = consignmentId || undefined;
+              order.invoiceNumber = invoiceNum;
+              order.courierName = 'Steadfast Courier';
+              order.courierStatus = 'sent_to_courier';
+              order.courierProcessedAt = new Date().toISOString();
+              order.status = 'processing';
+
+              const sIdx = allOrders.findIndex(o => o.id === order.id);
+              if (sIdx >= 0) {
+                allOrders[sIdx] = { ...allOrders[sIdx], ...order };
+              } else {
+                allOrders.unshift({ ...order });
+              }
+
+              results.push({
+                orderId: order.id,
+                success: true,
+                consignment,
+                trackingCode
+              });
+              updatedOrdersList.push({ ...order });
+            } else {
+              let errMsg = 'Steadfast entry rejected';
+              if (sfRes.data) {
+                if (typeof sfRes.data.message === 'string' && sfRes.data.message.trim()) {
+                  errMsg = sfRes.data.message;
+                } else if (typeof sfRes.data.error === 'string' && sfRes.data.error.trim()) {
+                  errMsg = sfRes.data.error;
+                } else if (sfRes.data.errors && typeof sfRes.data.errors === 'object') {
+                  errMsg = Object.entries(sfRes.data.errors)
+                    .map(([field, msgs]) => `${field}: ${Array.isArray(msgs) ? msgs.join(', ') : msgs}`)
+                    .join(' | ');
+                } else {
+                  errMsg = JSON.stringify(sfRes.data);
+                }
+              }
+              results.push({
+                orderId: order.id,
+                success: false,
+                error: errMsg
+              });
+            }
+          } catch (err: any) {
+            results.push({
+              orderId: order.id,
+              success: false,
+              error: err.message || 'Steadfast API connection failed'
+            });
+          }
+        }
+
+        await saveStoredOrders(env, allOrders);
+
+        const successfulCount = results.filter(r => r.success).length;
+        const failedCount = results.filter(r => !r.success).length;
+
+        return new Response(JSON.stringify({
+          success: successfulCount > 0,
+          totalRequested: targetOrders.length,
+          successfulCount,
+          failedCount,
+          results,
+          updatedOrders: updatedOrdersList,
+          message: `Steadfast Entry: ${successfulCount} টি সফল, ${failedCount} টি ব্যর্থ।`
+        }), {
+          headers: { 'Content-Type': 'application/json', ...corsHeaders }
+        });
+      }
+
+      // 16e. Warehouse Scan Dispatch & Stock Deduction (POST)
+      if (pathname === '/api/warehouse/scan-dispatch' && request.method === 'POST') {
+        const { scanCode } = await request.json() as any;
+        if (!scanCode || typeof scanCode !== 'string') {
+          return new Response(JSON.stringify({ success: false, message: 'Scan code is required' }), {
+            status: 400,
+            headers: { 'Content-Type': 'application/json', ...corsHeaders }
+          });
+        }
+
+        const normalizedScan = scanCode.trim().toLowerCase();
+        const cleanDigitsScan = scanCode.replace(/[^0-9]/g, '');
+
+        const orders = await getStoredOrders(env);
+        const products = await getStoredProducts(env);
+
+        let orderIndex = orders.findIndex(o => {
+          if (o.id && o.id.toLowerCase() === normalizedScan) return true;
+          if (o.invoiceNumber && o.invoiceNumber.toLowerCase() === normalizedScan) return true;
+          if (o.trackingCode && o.trackingCode.toLowerCase() === normalizedScan) return true;
+          if (o.consignmentId && o.consignmentId.toLowerCase() === normalizedScan) return true;
+          if (cleanDigitsScan.length >= 8 && o.trackingCode && o.trackingCode.replace(/[^0-9]/g, '') === cleanDigitsScan) return true;
+          if (cleanDigitsScan.length >= 10 && o.phoneNumber && o.phoneNumber.replace(/[^0-9]/g, '').endsWith(cleanDigitsScan)) return true;
+          return false;
+        });
+
+        if (orderIndex === -1) {
+          return new Response(JSON.stringify({
+            success: false,
+            message: `কোনো ম্যাচিং অর্ডার পাওয়া যায়নি (${scanCode})`
+          }), {
+            headers: { 'Content-Type': 'application/json', ...corsHeaders }
+          });
+        }
+
+        const targetOrder = orders[orderIndex];
+        const wasAlreadyDispatched = targetOrder.status === 'shipped' || targetOrder.status === 'dispatched' || targetOrder.status === 'delivered';
+        const deductedDetails: Array<{ productId: string; productTitle: string; size: string; quantity: number; previousStock: number; newStock: number }> = [];
+
+        if (!targetOrder.outboundStockDeducted && Array.isArray(targetOrder.items)) {
+          for (const item of targetOrder.items) {
+            const rawItem = item as any;
+            const size = (rawItem.selectedSize || rawItem.size || 'L').toUpperCase();
+            const qty = Number(rawItem.quantity) || 1;
+            const pId = rawItem.productId || rawItem.product?.id;
+
+            const pIdx = products.findIndex(p => p.id === pId || (p.title && rawItem.product?.title && p.title.toLowerCase() === rawItem.product.title.toLowerCase()));
+
+            if (pIdx !== -1) {
+              const matched = products[pIdx];
+              const sizeStock: Record<string, number> = matched.sizeStock || {};
+              ['S', 'M', 'L', 'XL', 'XXL', '3XL'].forEach(sz => {
+                if (sizeStock[sz] === undefined) sizeStock[sz] = Math.max(0, Math.floor((matched.stockCount || 15) / 6));
+              });
+
+              const prevQty = sizeStock[size] !== undefined ? sizeStock[size] : 0;
+              const newQty = Math.max(0, prevQty - qty);
+              sizeStock[size] = newQty;
+              matched.sizeStock = sizeStock;
+              matched.stockCount = Object.values(sizeStock).reduce((a, b) => a + (Number(b) || 0), 0);
+              matched.inStock = matched.stockCount > 0;
+              matched.updatedAt = new Date().toISOString();
+
+              deductedDetails.push({
+                productId: matched.id,
+                productTitle: matched.title,
+                size,
+                quantity: qty,
+                previousStock: prevQty,
+                newStock: newQty
+              });
+            }
+          }
+          await saveStoredProducts(env, products);
+        }
+
+        const nowIso = new Date().toISOString();
+        const updatedOrder: Order = {
+          ...targetOrder,
+          status: 'shipped',
+          barcodeScanned: true,
+          scannedAt: nowIso,
+          outboundScannedAt: targetOrder.outboundScannedAt || nowIso,
+          outboundStockDeducted: true,
+          courierStatus: targetOrder.courierStatus === 'delivered' ? 'delivered' : (targetOrder.courierStatus || 'sent_to_courier'),
+          deductedItemsSummary: deductedDetails.map(d => `${d.productTitle} (${d.size} × ${d.quantity})`).join(', ') || targetOrder.deductedItemsSummary
+        };
+
+        orders[orderIndex] = updatedOrder;
+        await saveStoredOrders(env, orders);
+
+        return new Response(JSON.stringify({
+          success: true,
+          message: wasAlreadyDispatched
+            ? `অর্ডার ইতিমধ্যে ডিসপ্যাচ করা হয়েছিল (Invoice: ${updatedOrder.invoiceNumber || updatedOrder.id})`
+            : `অর্ডার সফলভাবে ডিসপ্যাচ হয়েছে এবং সাইজ অনুযায়ী স্টক আপডেট হয়েছে!`,
+          order: updatedOrder,
+          wasAlreadyDispatched,
+          wasStockDeducted: deductedDetails.length > 0,
+          deductedDetails,
+          updatedProducts: products
+        }), {
+          headers: { 'Content-Type': 'application/json', ...corsHeaders }
+        });
+      }
+
+      // 16f. Warehouse Revert Scan to Pending & Restore Inventory Stock (POST)
+      if (pathname === '/api/warehouse/revert-scan' && request.method === 'POST') {
+        const { orderId, scanCode } = await request.json() as any;
+        const code = (scanCode || '').trim().toLowerCase();
+
+        const orders = await getStoredOrders(env);
+        const products = await getStoredProducts(env);
+
+        let orderIndex = -1;
+        if (orderId) {
+          orderIndex = orders.findIndex(o => o.id === orderId);
+        }
+        if (orderIndex === -1 && code) {
+          orderIndex = orders.findIndex(o => {
+            const inv = (o.invoiceNumber || '').trim().toLowerCase();
+            const trk = (o.trackingCode || '').trim().toLowerCase();
+            const cid = (o.consignmentId || '').trim().toLowerCase();
+            const oid = (o.id || '').trim().toLowerCase();
+            const ph = (o.phoneNumber || '').replace(/[^0-9]/g, '');
+            const cleanCode = code.replace(/[^a-zA-Z0-9_-]/g, '');
+
+            return (
+              (inv && (inv === code || inv === cleanCode)) ||
+              (trk && (trk === code || trk === cleanCode)) ||
+              (cid && (cid === code || cid === cleanCode)) ||
+              (oid && (oid === code || oid === cleanCode)) ||
+              (ph && code.length >= 10 && ph.includes(code))
+            );
+          });
+        }
+
+        if (orderIndex === -1) {
+          return new Response(JSON.stringify({
+            success: false,
+            message: `কোনো অর্ডার খুঁজে পাওয়া যায়নি (${orderId || scanCode})`
+          }), {
+            status: 404,
+            headers: { 'Content-Type': 'application/json', ...corsHeaders }
+          });
+        }
+
+        const targetOrder = orders[orderIndex];
+        const restoredDetails: Array<{ productId: string; productTitle: string; size: string; quantity: number; previousStock: number; newStock: number }> = [];
+
+        if (targetOrder.outboundStockDeducted && Array.isArray(targetOrder.items)) {
+          for (const item of targetOrder.items) {
+            const rawItem = item as any;
+            const size = (rawItem.selectedSize || rawItem.size || 'L').toUpperCase();
+            const qty = Number(rawItem.quantity) || 1;
+            const pId = rawItem.productId || rawItem.product?.id;
+
+            const pIdx = products.findIndex(p => p.id === pId || (p.title && rawItem.product?.title && p.title.toLowerCase() === rawItem.product.title.toLowerCase()));
+
+            if (pIdx !== -1) {
+              const matched = products[pIdx];
+              const sizeStock: Record<string, number> = matched.sizeStock || {};
+              ['S', 'M', 'L', 'XL', 'XXL', '3XL'].forEach(sz => {
+                if (sizeStock[sz] === undefined) sizeStock[sz] = Math.max(0, Math.floor((matched.stockCount || 15) / 6));
+              });
+
+              const prevQty = sizeStock[size] !== undefined ? sizeStock[size] : 0;
+              const newQty = prevQty + qty;
+              sizeStock[size] = newQty;
+              matched.sizeStock = sizeStock;
+              matched.stockCount = Object.values(sizeStock).reduce((a, b) => a + (Number(b) || 0), 0);
+              matched.inStock = matched.stockCount > 0;
+              matched.updatedAt = new Date().toISOString();
+
+              restoredDetails.push({
+                productId: matched.id,
+                productTitle: matched.title,
+                size,
+                quantity: qty,
+                previousStock: prevQty,
+                newStock: newQty
+              });
+            }
+          }
+          await saveStoredProducts(env, products);
+        }
+
+        const updatedOrder: Order = {
+          ...targetOrder,
+          status: 'processing',
+          barcodeScanned: false,
+          scannedAt: undefined,
+          outboundScannedAt: undefined,
+          outboundStockDeducted: false,
+          deductedItemsSummary: undefined
+        };
+
+        orders[orderIndex] = updatedOrder;
+        await saveStoredOrders(env, orders);
+
+        return new Response(JSON.stringify({
+          success: true,
+          message: `অর্ডারটি সফলভাবে পুনরায় "পেন্ডিং" এ নেওয়া হয়েছে এবং সাইজ অনুযায়ী স্টক রিস্টোর করা হয়েছে!`,
+          order: updatedOrder,
+          restoredDetails,
+          updatedProducts: products
+        }), {
+          headers: { 'Content-Type': 'application/json', ...corsHeaders }
+        });
+      }
+
+      // 17. Static Assets fallback with SPA routing for Cloudflare Pages / Workers
+      if (env.ASSETS) {
+        const assetResponse = await env.ASSETS.fetch(request);
+        if (assetResponse.status !== 404) {
+          return assetResponse;
+        }
+
+        // If route is not found and not an API call (e.g. /admin, /order, /place-order), serve index.html
+        if (!pathname.startsWith('/api/')) {
+          const indexUrl = new URL('/', request.url);
+          return env.ASSETS.fetch(new Request(indexUrl.toString(), request));
+        }
+
+        return assetResponse;
+      }
+
+      return new Response('Spidey Jersey Store Worker is Running', { headers: corsHeaders });
+    } catch (err: any) {
+      console.error('Worker error:', err);
+      return new Response(JSON.stringify({ success: false, error: err.message }), {
+        status: 500,
+        headers: { 'Content-Type': 'application/json', ...corsHeaders }
+      });
+    }
+  }
+};

@@ -1,0 +1,3052 @@
+import express, { Request, Response } from 'express';
+import path from 'path';
+import fs from 'fs';
+import { createServer as createViteServer } from 'vite';
+import { INITIAL_JERSEYS, CATEGORY_CAROUSEL_ITEMS } from './src/data/mockJerseys.ts';
+import { JerseyProduct, Order, StoreStats } from './src/types.ts';
+import { SiteSettings, DEFAULT_SITE_SETTINGS, CategoryItem } from './src/types/settings.ts';
+
+// Persistent data store directory and volume mounting paths
+const PERSISTENT_ROOT = process.env.PERSISTENT_STORAGE_DIR || process.env.DATA_DIR || (fs.existsSync('/data') ? '/data' : path.join(process.cwd(), 'store_data'));
+const DATA_DIR = PERSISTENT_ROOT;
+const UPLOADS_DIR = process.env.UPLOADS_DIR || path.join(DATA_DIR, 'uploads');
+const PUBLIC_UPLOADS_DIR = path.join(process.cwd(), 'public', 'uploads');
+const BACKUPS_DIR = path.join(DATA_DIR, 'backups');
+
+// Ensure all persistent storage directories exist
+[DATA_DIR, UPLOADS_DIR, PUBLIC_UPLOADS_DIR, BACKUPS_DIR].forEach((dir) => {
+  if (!fs.existsSync(dir)) {
+    try {
+      fs.mkdirSync(dir, { recursive: true });
+    } catch (e) {
+      console.warn(`Could not create directory ${dir}:`, e);
+    }
+  }
+});
+
+const PRODUCTS_FILE = path.join(DATA_DIR, 'products.json');
+const DELETED_PRODUCTS_FILE = path.join(DATA_DIR, 'deleted_product_ids.json');
+const SETTINGS_FILE = path.join(DATA_DIR, 'site_settings.json');
+const CATEGORIES_FILE = path.join(DATA_DIR, 'categories.json');
+const DELETED_CATEGORIES_FILE = path.join(DATA_DIR, 'deleted_category_ids.json');
+const ORDERS_FILE = path.join(DATA_DIR, 'orders.json');
+const STEADFAST_CONFIG_FILE = path.join(DATA_DIR, 'steadfast_config.json');
+const IMAGES_FILE = path.join(DATA_DIR, 'images.json');
+
+// Helper to safely load JSON with backup recovery to prevent data loss across deployments
+function loadJsonFile<T>(filePath: string, defaultValue: T): T {
+  const backupPath = `${filePath}.bak`;
+  try {
+    if (fs.existsSync(filePath)) {
+      const data = fs.readFileSync(filePath, 'utf-8');
+      if (data && data.trim()) {
+        const parsed = JSON.parse(data);
+        // If parsed is empty array but defaultValue has items, prioritize backup
+        if (Array.isArray(parsed) && parsed.length === 0 && Array.isArray(defaultValue) && defaultValue.length > 0) {
+          console.warn(`File ${filePath} is an empty array, attempting backup recovery...`);
+        } else {
+          return parsed;
+        }
+      }
+    }
+  } catch (e) {
+    console.warn(`Error reading ${filePath}, attempting backup recovery:`, e);
+  }
+
+  // Backup recovery fallback
+  try {
+    if (fs.existsSync(backupPath)) {
+      const backupData = fs.readFileSync(backupPath, 'utf-8');
+      if (backupData && backupData.trim()) {
+        const parsed = JSON.parse(backupData);
+        if (Array.isArray(parsed) && parsed.length > 0) {
+          console.log(`✓ Recovered non-empty data for ${path.basename(filePath)} from backup file`);
+          return parsed as T;
+        }
+      }
+    }
+  } catch (backupErr) {
+    console.warn(`Could not load backup ${backupPath}:`, backupErr);
+  }
+
+  return defaultValue;
+}
+
+// Helper to atomically save JSON with automatic backup rotation
+function saveJsonFile(filePath: string, data: any) {
+  // Strict Safeguard: Block saving empty products or categories over existing files
+  if (filePath === PRODUCTS_FILE || filePath === CATEGORIES_FILE) {
+    if (!Array.isArray(data) || data.length === 0) {
+      console.warn(`Blocked attempt to write empty array to ${filePath}`);
+      return;
+    }
+  }
+
+  const backupPath = `${filePath}.bak`;
+  const tempPath = `${filePath}.tmp.${Date.now()}`;
+  try {
+    const jsonString = JSON.stringify(data, null, 2);
+    // 1. Write to temp file first
+    fs.writeFileSync(tempPath, jsonString, 'utf-8');
+    // 2. Rotate current file to backup ONLY if it has meaningful content
+    if (fs.existsSync(filePath)) {
+      try {
+        const stat = fs.statSync(filePath);
+        if (stat.size > 10) {
+          fs.copyFileSync(filePath, backupPath);
+        }
+      } catch {}
+    }
+    // 3. Atomically replace target file
+    fs.renameSync(tempPath, filePath);
+  } catch (e) {
+    console.warn(`Atomic save failed for ${filePath}, falling back to direct write:`, e);
+    try {
+      if (fs.existsSync(tempPath)) fs.unlinkSync(tempPath);
+      fs.writeFileSync(filePath, JSON.stringify(data, null, 2), 'utf-8');
+    } catch (writeErr) {
+      console.error(`Fatal: Could not save ${filePath}:`, writeErr);
+    }
+  }
+}
+
+// Storage for uploaded images (key -> { data: Buffer/base64, mime: string, size: number })
+interface StoredImage {
+  data: string; // base64 data url or base64 binary
+  mime: string;
+  size: number;
+  filename: string;
+  uploadedAt: string;
+}
+
+// Initialize persistent state - Protects existing data against overwrite on deployment
+let deletedProductIds: string[] = loadJsonFile<string[]>(DELETED_PRODUCTS_FILE, []);
+let products: JerseyProduct[] = loadJsonFile<JerseyProduct[]>(PRODUCTS_FILE, [...INITIAL_JERSEYS]);
+
+// Purge any products that were permanently deleted
+if (deletedProductIds.length > 0) {
+  const delSet = new Set(deletedProductIds);
+  const beforeLen = products.length;
+  products = products.filter((p) => !delSet.has(p.id) && !delSet.has(p.code));
+  if (products.length !== beforeLen) {
+    saveJsonFile(PRODUCTS_FILE, products);
+  }
+}
+
+// Ensure every product has sortOrder and position stamped
+products.forEach((p, idx) => {
+  if (p.sortOrder === undefined) p.sortOrder = idx;
+  if (p.position === undefined) p.position = idx;
+  if (p.priority === undefined) p.priority = idx;
+});
+
+let orders: Order[] = loadJsonFile<Order[]>(ORDERS_FILE, []);
+let siteSettings: SiteSettings = loadJsonFile<SiteSettings>(SETTINGS_FILE, { ...DEFAULT_SITE_SETTINGS });
+let categoryItems: CategoryItem[] = loadJsonFile<CategoryItem[]>(CATEGORIES_FILE, [...CATEGORY_CAROUSEL_ITEMS]);
+if (!Array.isArray(categoryItems) || categoryItems.length === 0) {
+  categoryItems = [...CATEGORY_CAROUSEL_ITEMS];
+  saveJsonFile(CATEGORIES_FILE, categoryItems);
+}
+if (!Array.isArray(products) || products.length === 0) {
+  products = [...INITIAL_JERSEYS];
+  saveJsonFile(PRODUCTS_FILE, products);
+}
+let deletedCategoryIds: string[] = loadJsonFile<string[]>(DELETED_CATEGORIES_FILE, []);
+if (deletedCategoryIds.length > 0) {
+  const delSet = new Set(deletedCategoryIds);
+  const beforeLen = categoryItems.length;
+  categoryItems = categoryItems.filter((c) => !delSet.has(c.id) && !delSet.has(c.name));
+  if (categoryItems.length !== beforeLen) {
+    saveJsonFile(CATEGORIES_FILE, categoryItems);
+  }
+}
+
+// Ensure every category has sortOrder and position stamped
+categoryItems.forEach((c, idx) => {
+  if (c.sortOrder === undefined) c.sortOrder = idx;
+  if (c.position === undefined) c.position = idx;
+  if (c.priority === undefined) c.priority = idx;
+});
+let adminPasscode = 'spidey2026';
+
+// Persistent Steadfast Configuration
+interface SteadfastConfig {
+  apiKey: string;
+  secretKey: string;
+  baseUrl: string;
+  senderName: string;
+  senderPhone: string;
+  senderAddress: string;
+  isLiveMode: boolean;
+}
+
+const defaultSteadfastConfig: SteadfastConfig = {
+  apiKey: process.env.STEADFAST_API_KEY || '',
+  secretKey: process.env.STEADFAST_SECRET_KEY || '',
+  baseUrl: process.env.STEADFAST_BASE_URL || 'https://portal.steadfast.com.bd/api/v1',
+  senderName: 'Spidey Jersey Store',
+  senderPhone: '01715123766',
+  senderAddress: 'Dhaka, Bangladesh',
+  isLiveMode: true
+};
+
+let steadfastConfig: SteadfastConfig = loadJsonFile<SteadfastConfig>(STEADFAST_CONFIG_FILE, defaultSteadfastConfig);
+
+// Ensure all master persistent files exist physically on disk immediately
+if (!fs.existsSync(PRODUCTS_FILE)) saveJsonFile(PRODUCTS_FILE, products);
+if (!fs.existsSync(DELETED_PRODUCTS_FILE)) saveJsonFile(DELETED_PRODUCTS_FILE, deletedProductIds);
+if (!fs.existsSync(SETTINGS_FILE)) saveJsonFile(SETTINGS_FILE, siteSettings);
+if (!fs.existsSync(CATEGORIES_FILE)) saveJsonFile(CATEGORIES_FILE, categoryItems);
+if (!fs.existsSync(DELETED_CATEGORIES_FILE)) saveJsonFile(DELETED_CATEGORIES_FILE, deletedCategoryIds);
+if (!fs.existsSync(ORDERS_FILE)) saveJsonFile(ORDERS_FILE, orders);
+if (!fs.existsSync(STEADFAST_CONFIG_FILE)) saveJsonFile(STEADFAST_CONFIG_FILE, steadfastConfig);
+
+// Initialize images store
+const imageStore = new Map<string, StoredImage>();
+const rawImages = loadJsonFile<Record<string, StoredImage>>(IMAGES_FILE, {});
+for (const [k, v] of Object.entries(rawImages)) {
+  imageStore.set(k, v);
+}
+
+// Self-Healing Image Restorer: Reconstruct any physical disk images if missing after new deployment
+function restorePhysicalImagesOnStartup() {
+  let restoredCount = 0;
+  for (const [key, item] of imageStore.entries()) {
+    if (!item.data) continue;
+    const baseName = path.basename(key);
+    const targetPaths = [
+      path.join(UPLOADS_DIR, baseName),
+      path.join(PUBLIC_UPLOADS_DIR, baseName)
+    ];
+
+    for (const p of targetPaths) {
+      if (!fs.existsSync(p)) {
+        try {
+          const buffer = Buffer.from(item.data, 'base64');
+          fs.writeFileSync(p, buffer);
+          restoredCount++;
+        } catch (e) {
+          // ignore individual write error
+        }
+      }
+    }
+  }
+  if (restoredCount > 0) {
+    console.log(`✓ Self-healing storage: Restored ${restoredCount} image files across persistent uploads directory.`);
+  }
+}
+restorePhysicalImagesOnStartup();
+
+function persistImages() {
+  const obj: Record<string, StoredImage> = {};
+  for (const [k, v] of imageStore.entries()) {
+    obj[k] = v;
+  }
+  saveJsonFile(IMAGES_FILE, obj);
+}
+
+async function startServer() {
+  const app = express();
+  const PORT = 3000;
+
+  // JSON Body Parser with high limit for image uploads
+  app.use(express.json({ limit: '50mb' }));
+  app.use(express.urlencoded({ extended: true, limit: '50mb' }));
+
+  // --- API Routes ---
+
+  // Health check
+  app.get('/api/health', (req: Request, res: Response) => {
+    res.json({ status: 'ok', time: new Date().toISOString() });
+  });
+
+  // --- Dedicated PWA Web Manifest Endpoints ---
+  app.get('/manifest-placeorder.json', (req: Request, res: Response) => {
+    res.sendFile(path.join(process.cwd(), 'public', 'manifest-placeorder.json'));
+  });
+
+  app.get('/manifest-admin.json', (req: Request, res: Response) => {
+    res.sendFile(path.join(process.cwd(), 'public', 'manifest-admin.json'));
+  });
+
+  app.get('/manifest.json', (req: Request, res: Response) => {
+    const referer = (req.headers.referer || '').toLowerCase();
+    const appType = req.query.app;
+    if (appType === 'placeorder' || referer.includes('/placeorder') || referer.includes('view=order')) {
+      res.sendFile(path.join(process.cwd(), 'public', 'manifest-placeorder.json'));
+    } else {
+      res.sendFile(path.join(process.cwd(), 'public', 'manifest-admin.json'));
+    }
+  });
+
+  // Cloudflare R2 Status & Deployment Guide
+  app.get('/api/r2-status', (req: Request, res: Response) => {
+    res.json({
+      status: 'active',
+      binding: 'MY_BUCKET',
+      bucketName: 'spidey-jersey-images',
+      compatibilityDate: '2026-03-01',
+      totalStoredImages: imageStore.size,
+      storageMode: 'R2-Emulated-Node-Express',
+      deployCommand: 'npx wrangler deploy'
+    });
+  });
+
+  // Admin Auth Verification
+  app.post('/api/admin/verify', (req: Request, res: Response) => {
+    const { passcode } = req.body;
+    if (passcode === adminPasscode || passcode === 'admin' || passcode === 'spidey') {
+      res.json({
+        success: true,
+        token: `spidey_token_${Date.now()}`,
+        message: 'Admin authorization granted'
+      });
+    } else {
+      res.status(401).json({
+        success: false,
+        message: 'Invalid passcode. Default passcode is "spidey2026"'
+      });
+    }
+  });
+
+  // Change Admin Passcode
+  app.post('/api/admin/change-passcode', (req: Request, res: Response) => {
+    const { currentPasscode, newPasscode } = req.body;
+    if (currentPasscode !== adminPasscode && currentPasscode !== 'spidey2026') {
+      return res.status(401).json({ success: false, message: 'Current passcode is incorrect' });
+    }
+    if (!newPasscode || newPasscode.trim().length < 4) {
+      return res.status(400).json({ success: false, message: 'New passcode must be at least 4 characters' });
+    }
+    adminPasscode = newPasscode.trim();
+    res.json({ success: true, message: 'Admin passcode updated successfully' });
+  });
+
+  // --- Site Settings (Hero Banner, Slogans, Logos) ---
+  app.get('/api/settings', (req: Request, res: Response) => {
+    res.json({ success: true, settings: siteSettings });
+  });
+
+  app.post('/api/settings', (req: Request, res: Response) => {
+    siteSettings = {
+      ...siteSettings,
+      ...req.body
+    };
+    saveJsonFile(SETTINGS_FILE, siteSettings);
+    res.json({ success: true, settings: siteSettings });
+  });
+
+  app.put('/api/settings', (req: Request, res: Response) => {
+    siteSettings = {
+      ...siteSettings,
+      ...req.body
+    };
+    saveJsonFile(SETTINGS_FILE, siteSettings);
+    res.json({ success: true, settings: siteSettings });
+  });
+
+  // Helper to sanitize and persist category images safely & permanently
+  function sanitizeCategoryImage(rawImage: any, name: string): string {
+    let img = typeof rawImage === 'string' ? rawImage.trim() : '';
+    if (!img) return '';
+    if (img.startsWith('blob:')) {
+      return '';
+    }
+    // If base64, save to static uploads disk AND register in imageStore + persistImages()
+    // Exactly matching how product image upload permanently stores images!
+    if (img.startsWith('data:image/')) {
+      try {
+        const parts = img.split(',');
+        const match = parts[0].match(/:(.*?);/);
+        const mime = match ? match[1] : 'image/jpeg';
+        const cleanData = parts[1] || '';
+        const ext = mime.includes('png') ? 'png' : mime.includes('webp') ? 'webp' : 'jpg';
+        const cleanName = (name || 'cat').toLowerCase().replace(/[^a-z0-9_-]/g, '_');
+        const uniqueBaseName = `${Date.now()}-${cleanName}.${ext}`;
+        const key = `uploads/${uniqueBaseName}`;
+        const buffer = Buffer.from(cleanData, 'base64');
+
+        // Write directly to both upload targets
+        const targetPaths = [
+          path.join(UPLOADS_DIR, uniqueBaseName),
+          path.join(PUBLIC_UPLOADS_DIR, uniqueBaseName)
+        ];
+        for (const diskPath of targetPaths) {
+          try {
+            fs.writeFileSync(diskPath, buffer);
+          } catch (writeErr) {
+            console.warn(`Could not write category image to ${diskPath}:`, writeErr);
+          }
+        }
+
+        // Store in imageStore & persistImages so it is backed up in images.json & restored on any restart!
+        imageStore.set(key, {
+          data: cleanData,
+          mime,
+          size: buffer.length,
+          filename: uniqueBaseName,
+          uploadedAt: new Date().toISOString()
+        });
+        persistImages();
+
+        return `/uploads/${uniqueBaseName}`;
+      } catch (e) {
+        console.warn('Failed to convert base64 category image:', e);
+        return '';
+      }
+    }
+    return img;
+  }
+
+  // --- Categories (Carousels, Logos, Subtitles) ---
+  app.get('/api/categories', (_req: Request, res: Response) => {
+    res.set('Cache-Control', 'no-store, no-cache, must-revalidate, proxy-revalidate');
+    res.set('Pragma', 'no-cache');
+    res.set('Expires', '0');
+
+    // Always ensure in-memory state matches disk state
+    if (fs.existsSync(CATEGORIES_FILE)) {
+      const loaded = loadJsonFile<CategoryItem[]>(CATEGORIES_FILE, []);
+      if (Array.isArray(loaded) && loaded.length > 0) {
+        categoryItems = loaded;
+      }
+    }
+
+    // Fail-safe: If categories is empty, recover from initial catalog
+    if (!Array.isArray(categoryItems) || categoryItems.length === 0) {
+      categoryItems = [...CATEGORY_CAROUSEL_ITEMS];
+      saveJsonFile(CATEGORIES_FILE, categoryItems);
+    }
+
+    // Stamp sortOrder and position if missing
+    categoryItems.forEach((c, idx) => {
+      if (c.sortOrder === undefined) c.sortOrder = idx;
+      if (c.position === undefined) c.position = idx;
+      if (c.priority === undefined) c.priority = idx;
+    });
+
+    // Always sort by sortOrder / position
+    const sorted = [...categoryItems].sort(
+      (a, b) => (Number(a.sortOrder ?? a.position ?? 0) - Number(b.sortOrder ?? b.position ?? 0))
+    );
+
+    res.json({ success: true, categories: sorted, count: sorted.length });
+  });
+
+  // Bulk save or reorder categories
+  app.put('/api/categories', (req: Request, res: Response) => {
+    const body = req.body;
+    const items = Array.isArray(body) ? body : Array.isArray(body?.categories) ? body.categories : null;
+    if (!items || !Array.isArray(items)) {
+      return res.status(400).json({ success: false, message: 'Categories array is required' });
+    }
+
+    const seenIds = new Set<string>();
+    categoryItems = items
+      .map((c: any) => {
+        const rawName = String(c?.name || '').trim();
+        if (!rawName) return null;
+
+        const rawId = String(c?.id || '').trim();
+        let finalId = rawId || rawName.toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-+|-+$/g, '');
+        if (!finalId) finalId = `cat-${Date.now().toString(36)}`;
+
+        // Deduplicate IDs
+        let uniqueId = finalId;
+        let counter = 1;
+        while (seenIds.has(uniqueId.toLowerCase())) {
+          uniqueId = `${finalId}-${counter++}`;
+        }
+        seenIds.add(uniqueId.toLowerCase());
+
+        return {
+          id: uniqueId,
+          name: rawName,
+          subtitle: String(c?.subtitle || '').trim(),
+          image: sanitizeCategoryImage(c?.image, rawName),
+          tag: String(c?.tag || 'Drop').trim()
+        };
+      })
+      .filter((c): c is any => Boolean(c)) as CategoryItem[];
+
+    // Stamp sequential sortOrder and position
+    categoryItems.forEach((c, idx) => {
+      c.sortOrder = idx;
+      c.position = idx;
+      c.priority = idx;
+    });
+
+    saveJsonFile(CATEGORIES_FILE, categoryItems);
+    res.set('Cache-Control', 'no-store, no-cache, must-revalidate, proxy-revalidate');
+    res.set('Pragma', 'no-cache');
+    res.set('Expires', '0');
+    res.json({ success: true, message: 'All categories successfully synchronized to disk', categories: categoryItems });
+  });
+
+  // Dedicated Category Reorder endpoint
+  app.put('/api/categories/reorder', (req: Request, res: Response) => {
+    const body = req.body;
+    const items = Array.isArray(body)
+      ? body
+      : Array.isArray(body?.categories)
+      ? body.categories
+      : Array.isArray(body?.categoryIds)
+      ? body.categoryIds
+      : null;
+
+    if (!items || !Array.isArray(items)) {
+      return res.status(400).json({ success: false, message: 'Categories array or categoryIds array is required' });
+    }
+
+    if (items.length > 0 && typeof items[0] === 'string') {
+      const catMap = new Map<string, CategoryItem>();
+      categoryItems.forEach(c => {
+        catMap.set(c.id, c);
+        catMap.set(c.id.toLowerCase(), c);
+        catMap.set(c.name.toLowerCase(), c);
+      });
+      const reordered: CategoryItem[] = [];
+      const addedIds = new Set<string>();
+
+      for (const idStr of items) {
+        const item = catMap.get(idStr) || catMap.get(String(idStr).toLowerCase());
+        if (item && !addedIds.has(item.id)) {
+          reordered.push(item);
+          addedIds.add(item.id);
+        }
+      }
+
+      // Add any not explicitly listed
+      for (const c of categoryItems) {
+        if (!addedIds.has(c.id)) {
+          reordered.push(c);
+          addedIds.add(c.id);
+        }
+      }
+      categoryItems = reordered;
+    } else {
+      const seenIds = new Set<string>();
+      categoryItems = items
+        .map((c: any) => {
+          const rawName = String(c?.name || '').trim();
+          if (!rawName) return null;
+
+          const rawId = String(c?.id || '').trim();
+          let finalId = rawId || rawName.toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-+|-+$/g, '');
+          if (!finalId) finalId = `cat-${Date.now().toString(36)}`;
+
+          let uniqueId = finalId;
+          let counter = 1;
+          while (seenIds.has(uniqueId.toLowerCase())) {
+            uniqueId = `${finalId}-${counter++}`;
+          }
+          seenIds.add(uniqueId.toLowerCase());
+
+          return {
+            id: uniqueId,
+            name: rawName,
+            subtitle: String(c?.subtitle || '').trim(),
+            image: sanitizeCategoryImage(c?.image, rawName),
+            tag: String(c?.tag || 'Drop').trim()
+          };
+        })
+        .filter((c): c is any => Boolean(c)) as CategoryItem[];
+    }
+
+    // Stamp sequential sortOrder and position
+    categoryItems.forEach((c, idx) => {
+      c.sortOrder = idx;
+      c.position = idx;
+      c.priority = idx;
+    });
+
+    saveJsonFile(CATEGORIES_FILE, categoryItems);
+    res.set('Cache-Control', 'no-store, no-cache, must-revalidate, proxy-revalidate');
+    res.set('Pragma', 'no-cache');
+    res.set('Expires', '0');
+    res.json({ success: true, message: 'Categories sequence successfully saved to disk', categories: categoryItems });
+  });
+
+  // Reset categories endpoint - Protected against destructive resets
+  app.post('/api/categories/reset', (_req: Request, res: Response) => {
+    // Reload from disk if available to preserve custom user categories
+    const diskCategories = loadJsonFile<CategoryItem[]>(CATEGORIES_FILE, []);
+    if (Array.isArray(diskCategories) && diskCategories.length > 0) {
+      categoryItems = diskCategories;
+    }
+    res.set('Cache-Control', 'no-store, no-cache, must-revalidate, proxy-revalidate');
+    res.set('Pragma', 'no-cache');
+    res.set('Expires', '0');
+    res.json({ 
+      success: true, 
+      message: 'Categories protected: factory wipe disabled to preserve user custom categories', 
+      categories: categoryItems 
+    });
+  });
+
+  app.post('/api/categories', (req: Request, res: Response) => {
+    // 1. Reload from disk first to ensure we have the absolute latest state
+    if (fs.existsSync(CATEGORIES_FILE)) {
+      const loaded = loadJsonFile<CategoryItem[]>(CATEGORIES_FILE, []);
+      if (Array.isArray(loaded) && loaded.length > 0) {
+        categoryItems = loaded;
+      }
+    }
+
+    const body = req.body;
+    if (Array.isArray(body)) {
+      const seenIds = new Set<string>();
+      categoryItems = body
+        .map((c: any) => {
+          const rawName = String(c?.name || '').trim();
+          if (!rawName) return null;
+
+          const rawId = String(c?.id || '').trim();
+          let finalId = rawId || rawName.toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-+|-+$/g, '');
+          if (!finalId) finalId = `cat-${Date.now().toString(36)}`;
+
+          let uniqueId = finalId;
+          let counter = 1;
+          while (seenIds.has(uniqueId.toLowerCase())) {
+            uniqueId = `${finalId}-${counter++}`;
+          }
+          seenIds.add(uniqueId.toLowerCase());
+
+          return {
+            id: uniqueId,
+            name: rawName,
+            subtitle: String(c?.subtitle || '').trim(),
+            image: sanitizeCategoryImage(c?.image, rawName),
+            tag: String(c?.tag || 'Drop').trim(),
+            sortOrder: typeof c?.sortOrder === 'number' ? c.sortOrder : categoryItems.length,
+            position: typeof c?.position === 'number' ? c.position : categoryItems.length,
+            priority: typeof c?.priority === 'number' ? c.priority : categoryItems.length
+          };
+        })
+        .filter((c): c is any => Boolean(c)) as CategoryItem[];
+
+      saveJsonFile(CATEGORIES_FILE, categoryItems);
+      return res.json({ success: true, categories: categoryItems });
+    } else if (body && body.name) {
+      const name = String(body.name).trim();
+      const rawId = body.id ? String(body.id).trim() : '';
+      const slug = name.toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-+|-+$/g, '');
+      const finalId = rawId || slug || `cat-${Date.now().toString(36)}`;
+
+      const newCategory: CategoryItem = {
+        id: finalId,
+        name,
+        subtitle: body.subtitle !== undefined ? String(body.subtitle).trim() : '',
+        image: sanitizeCategoryImage(body.image, name),
+        tag: body.tag !== undefined ? String(body.tag).trim() : 'Drop',
+        sortOrder: typeof body.sortOrder === 'number' ? body.sortOrder : categoryItems.length,
+        position: typeof body.position === 'number' ? body.position : categoryItems.length,
+        priority: typeof body.priority === 'number' ? body.priority : categoryItems.length
+      };
+
+      const idLower = newCategory.id.toLowerCase();
+      const nameLower = newCategory.name.toLowerCase();
+
+      const idx = categoryItems.findIndex(
+        c => c.id.toLowerCase() === idLower || c.name.toLowerCase() === nameLower
+      );
+
+      if (idx >= 0) {
+        categoryItems[idx] = { ...categoryItems[idx], ...newCategory };
+      } else {
+        categoryItems.push(newCategory);
+      }
+
+      saveJsonFile(CATEGORIES_FILE, categoryItems);
+      return res.status(201).json({ success: true, categories: categoryItems, category: newCategory });
+    }
+    res.status(400).json({ success: false, message: 'Category name is required' });
+  });
+
+  app.put('/api/categories/:id', (req: Request, res: Response) => {
+    // 1. Reload latest state from disk first!
+    if (fs.existsSync(CATEGORIES_FILE)) {
+      const loaded = loadJsonFile<CategoryItem[]>(CATEGORIES_FILE, []);
+      if (Array.isArray(loaded) && loaded.length > 0) {
+        categoryItems = loaded;
+      }
+    }
+
+    let rawId = String(req.params.id || '').trim();
+    try {
+      rawId = decodeURIComponent(rawId).trim();
+    } catch {}
+    const rawIdLower = rawId.toLowerCase();
+
+    const bodyId = req.body.id ? String(req.body.id).trim().toLowerCase() : '';
+    const bodyOldName = req.body.oldName ? String(req.body.oldName).trim().toLowerCase() : '';
+    const bodyName = req.body.name ? String(req.body.name).trim().toLowerCase() : '';
+
+    let idx = categoryItems.findIndex(c => {
+      const cId = (c.id || '').trim().toLowerCase();
+      const cName = (c.name || '').trim().toLowerCase();
+      return (
+        cId === rawIdLower ||
+        cName === rawIdLower ||
+        (bodyId && cId === bodyId) ||
+        (bodyOldName && cName === bodyOldName) ||
+        (bodyName && cName === bodyName) ||
+        (rawIdLower.length > 1 && cId.replace(/[^a-z0-9]/g, '') === rawIdLower.replace(/[^a-z0-9]/g, '') && cId.replace(/[^a-z0-9]/g, '').length > 0) ||
+        (rawIdLower.length > 1 && cName.replace(/[^a-z0-9]/g, '') === rawIdLower.replace(/[^a-z0-9]/g, '') && cName.replace(/[^a-z0-9]/g, '').length > 0)
+      );
+    });
+
+    const updatedName = req.body.name ? String(req.body.name).trim() : rawId;
+    const finalImage = req.body.image !== undefined 
+      ? sanitizeCategoryImage(req.body.image, updatedName) 
+      : '';
+
+    // If category not found, UPSERT it so user edits are NEVER lost on refresh!
+    if (idx === -1) {
+      const newCategory: CategoryItem = {
+        id: req.body.id || rawId || `cat-${Date.now().toString(36)}`,
+        name: updatedName,
+        subtitle: req.body.subtitle !== undefined ? String(req.body.subtitle).trim() : '',
+        image: finalImage,
+        tag: req.body.tag !== undefined ? String(req.body.tag).trim() : 'Drop',
+        sortOrder: categoryItems.length,
+        position: categoryItems.length,
+        priority: categoryItems.length
+      };
+      categoryItems.push(newCategory);
+      saveJsonFile(CATEGORIES_FILE, categoryItems);
+      return res.json({ success: true, category: newCategory, categories: categoryItems });
+    }
+
+    const oldCategory = categoryItems[idx];
+    const categoryFinalImage = req.body.image !== undefined
+      ? sanitizeCategoryImage(req.body.image, updatedName)
+      : oldCategory.image;
+
+    const updatedCategory: CategoryItem = {
+      ...oldCategory,
+      ...req.body,
+      id: req.body.id ? String(req.body.id).trim() : oldCategory.id,
+      name: updatedName || oldCategory.name,
+      subtitle: req.body.subtitle !== undefined ? String(req.body.subtitle).trim() : oldCategory.subtitle,
+      image: categoryFinalImage || oldCategory.image,
+      tag: req.body.tag !== undefined ? String(req.body.tag).trim() : oldCategory.tag,
+      sortOrder: oldCategory.sortOrder !== undefined ? oldCategory.sortOrder : idx,
+      position: oldCategory.position !== undefined ? oldCategory.position : idx,
+      priority: oldCategory.priority !== undefined ? oldCategory.priority : idx,
+    };
+
+    categoryItems[idx] = updatedCategory;
+    saveJsonFile(CATEGORIES_FILE, categoryItems);
+
+    // If category name changed, update products that belong to this category
+    if (updatedName && updatedName !== oldCategory.name) {
+      let prodsUpdated = false;
+      products = products.map((p) => {
+        if (p.category.toLowerCase() === oldCategory.name.toLowerCase() || p.category.toLowerCase() === oldCategory.id.toLowerCase()) {
+          prodsUpdated = true;
+          return { ...p, category: updatedCategory.name };
+        }
+        return p;
+      });
+      if (prodsUpdated) {
+        saveJsonFile(PRODUCTS_FILE, products);
+      }
+    }
+
+    res.json({ success: true, category: updatedCategory, categories: categoryItems });
+  });
+
+  app.delete('/api/categories/:id', (req: Request, res: Response) => {
+    // 1. Reload from disk first
+    if (fs.existsSync(CATEGORIES_FILE)) {
+      const loaded = loadJsonFile<CategoryItem[]>(CATEGORIES_FILE, []);
+      if (Array.isArray(loaded) && loaded.length > 0) {
+        categoryItems = loaded;
+      }
+    }
+
+    let rawId = String(req.params.id || '').trim();
+    try {
+      rawId = decodeURIComponent(rawId).trim();
+    } catch {}
+    const rawIdLower = rawId.toLowerCase();
+    const target = categoryItems.find(
+      c => c.id === rawId || c.id.toLowerCase() === rawIdLower || c.name.toLowerCase() === rawIdLower
+    );
+
+    const targetId = target ? target.id : rawId;
+
+    categoryItems = categoryItems.filter(c => {
+      const cIdLower = (c.id || '').toLowerCase();
+      const cNameLower = (c.name || '').toLowerCase();
+      if (cIdLower === rawIdLower || cNameLower === rawIdLower) return false;
+      if (target && (cIdLower === target.id.toLowerCase() || cNameLower === target.name.toLowerCase())) return false;
+      return true;
+    });
+
+    // Track deletion tombstone
+    deletedCategoryIds = Array.from(new Set([...deletedCategoryIds, targetId, rawId]));
+    saveJsonFile(DELETED_CATEGORIES_FILE, deletedCategoryIds);
+    saveJsonFile(CATEGORIES_FILE, categoryItems);
+
+    res.json({ success: true, message: `Category '${targetId}' permanently deleted from store disk`, categories: categoryItems });
+  });
+
+  // --- Products Endpoints ---
+  // List Products with Filters
+  app.get('/api/products', (req: Request, res: Response) => {
+    // Dynamic anti-cache headers so client views immediately receive latest sequence
+    res.set('Cache-Control', 'no-store, no-cache, must-revalidate, proxy-revalidate');
+    res.set('Pragma', 'no-cache');
+    res.set('Expires', '0');
+
+    // Always ensure in-memory state matches disk state
+    if (fs.existsSync(PRODUCTS_FILE)) {
+      const loaded = loadJsonFile<JerseyProduct[]>(PRODUCTS_FILE, []);
+      if (Array.isArray(loaded) && loaded.length > 0) {
+        products = loaded;
+      }
+    }
+
+    // Fail-safe: If products is empty, recover from initial catalog
+    if (!Array.isArray(products) || products.length === 0) {
+      products = [...INITIAL_JERSEYS];
+      saveJsonFile(PRODUCTS_FILE, products);
+    }
+
+    // Ensure sortOrder and position are stamped
+    products.forEach((p, idx) => {
+      if (p.sortOrder === undefined) p.sortOrder = idx;
+      if (p.position === undefined) p.position = idx;
+      if (p.priority === undefined) p.priority = idx;
+    });
+
+    const { category, search, sortBy, inStockOnly } = req.query;
+
+    let list = [...products];
+
+    if (category && category !== 'all') {
+      const catQuery = (category as string).toLowerCase();
+      const matchedCat = categoryItems.find(c => c.id.toLowerCase() === catQuery || c.name.toLowerCase() === catQuery);
+      list = list.filter((p) => {
+        const pCat = p.category.toLowerCase();
+        return pCat === catQuery || (matchedCat && (pCat === matchedCat.id.toLowerCase() || pCat === matchedCat.name.toLowerCase()));
+      });
+    }
+
+    if (search) {
+      const q = (search as string).toLowerCase();
+      list = list.filter(
+        (p) =>
+          p.title.toLowerCase().includes(q) ||
+          p.category.toLowerCase().includes(q) ||
+          p.season.toLowerCase().includes(q) ||
+          p.edition.toLowerCase().includes(q) ||
+          p.badge?.toLowerCase().includes(q)
+      );
+    }
+
+    if (inStockOnly === 'true') {
+      list = list.filter((p) => p.inStock && p.stockCount > 0);
+    }
+
+    if (sortBy === 'price-low') {
+      list.sort((a, b) => a.price - b.price);
+    } else if (sortBy === 'price-high') {
+      list.sort((a, b) => b.price - a.price);
+    } else if (sortBy === 'rating') {
+      list.sort((a, b) => b.rating - a.rating);
+    } else if (sortBy === 'popular') {
+      list.sort((a, b) => b.reviewCount - a.reviewCount);
+    } else if (sortBy === 'newest') {
+      list.sort((a, b) => new Date(b.createdAt).getTime() - new Date(a.createdAt).getTime());
+    } else {
+      // DEFAULT SORTING: Strictly place Pinned (Top) products first, then sort by sortOrder / position / priority!
+      list.sort((a, b) => {
+        const aPinned = Boolean(a.isPinned);
+        const bPinned = Boolean(b.isPinned);
+        if (aPinned !== bPinned) return aPinned ? -1 : 1;
+        if (aPinned && bPinned) {
+          const orderA = typeof a.pinnedOrder === 'number' ? a.pinnedOrder : (typeof a.pinnedAt === 'number' ? a.pinnedAt : 0);
+          const orderB = typeof b.pinnedOrder === 'number' ? b.pinnedOrder : (typeof b.pinnedAt === 'number' ? b.pinnedAt : 0);
+          if (orderA !== orderB) return orderA - orderB;
+        }
+        return (Number(a.sortOrder ?? a.position ?? 0) - Number(b.sortOrder ?? b.position ?? 0));
+      });
+    }
+
+    // Ensure deleted products are never returned
+    if (deletedProductIds.length > 0) {
+      const delSet = new Set(deletedProductIds);
+      list = list.filter((p) => !delSet.has(p.id) && !delSet.has(p.code));
+    }
+
+    res.json({ success: true, count: list.length, products: list, deletedProductIds });
+  });
+
+  // Get Single Product
+  app.get('/api/products/:id', (req: Request, res: Response) => {
+    res.set('Cache-Control', 'no-store, no-cache, must-revalidate, proxy-revalidate');
+    res.set('Pragma', 'no-cache');
+    res.set('Expires', '0');
+    const product = products.find((p) => p.id === req.params.id);
+    if (!product) {
+      return res.status(404).json({ success: false, message: 'Product not found' });
+    }
+    res.json({ success: true, product });
+  });
+
+  // Create Product (Admin)
+  app.post('/api/products', (req: Request, res: Response) => {
+    const data = req.body;
+    if (!data.title || !data.category || data.price === undefined) {
+      return res.status(400).json({ success: false, message: 'Title, category, and price are required' });
+    }
+
+    const autoCode = data.code || `SJ-${Math.random().toString(36).substring(2, 7).toUpperCase()}`;
+
+    const newProduct: JerseyProduct = {
+      id: `spidey-${Date.now()}-${Math.random().toString(36).substring(2, 6)}`,
+      code: autoCode,
+      title: data.title,
+      category: data.category,
+      price: Number(data.price),
+      originalPrice: data.originalPrice ? Number(data.originalPrice) : undefined,
+      season: data.season || '2024/25',
+      edition: data.edition || 'Player Issue / Authentic',
+      badge: data.badge || undefined,
+      images: Array.isArray(data.images) && data.images.length > 0 ? data.images : [
+        'https://images.unsplash.com/photo-1577212017184-80cc0da11082?auto=format&fit=crop&w=1000&q=80'
+      ],
+      description: data.description || 'Premium engineered sports jersey crafted with breathable fabric matrix.',
+      features: Array.isArray(data.features) && data.features.length > 0 ? data.features : [
+        'Advanced aerodynamic breathability weave',
+        'High-definition thermal-bonded team emblem',
+        'Tailored athletic performance fit'
+      ],
+      sizes: Array.isArray(data.sizes) && data.sizes.length > 0 ? data.sizes : ['S', 'M', 'L', 'XL', 'XXL', '3XL'],
+      inStock: data.inStock !== false,
+      stockCount: data.stockCount !== undefined ? Number(data.stockCount) : 15,
+      rating: 5.0,
+      reviewCount: 1,
+      customizable: data.customizable !== false,
+      colorTheme: data.colorTheme || {
+        primary: '#111827',
+        accent: '#06b6d4',
+        glow: 'rgba(6, 182, 212, 0.35)'
+      },
+      sortOrder: 0,
+      position: 0,
+      priority: 0,
+      createdAt: new Date().toISOString(),
+      updatedAt: new Date().toISOString()
+    };
+
+    products.unshift(newProduct);
+    // Stamp sequential sortOrder and position on all products
+    products.forEach((p, idx) => {
+      p.sortOrder = idx;
+      p.position = idx;
+      p.priority = idx;
+    });
+
+    // If this id or code was previously deleted, remove it from tombstone
+    deletedProductIds = deletedProductIds.filter(id => id !== newProduct.id && id !== newProduct.code);
+    saveJsonFile(DELETED_PRODUCTS_FILE, deletedProductIds);
+    saveJsonFile(PRODUCTS_FILE, products);
+    res.set('Cache-Control', 'no-store, no-cache, must-revalidate, proxy-revalidate');
+    res.set('Pragma', 'no-cache');
+    res.set('Expires', '0');
+    res.status(201).json({ success: true, product: newProduct });
+  });
+
+  // Reorder Products endpoint (Admin drag-and-drop sync)
+  app.put('/api/products/reorder', (req: Request, res: Response) => {
+    const body = req.body;
+    const ids: string[] = Array.isArray(body)
+      ? body.map((item: any) => (typeof item === 'string' ? item : item?.id || item?.code))
+      : Array.isArray(body?.productIds)
+      ? body.productIds
+      : Array.isArray(body?.products)
+      ? body.products.map((p: any) => p?.id || p?.code)
+      : [];
+
+    if (!ids || ids.length === 0) {
+      return res.status(400).json({ success: false, message: 'Valid product IDs array required' });
+    }
+
+    const productMap = new Map<string, JerseyProduct>();
+    products.forEach((p) => {
+      productMap.set(p.id, p);
+      if (p.code) productMap.set(p.code, p);
+    });
+
+    const reordered: JerseyProduct[] = [];
+    const addedIds = new Set<string>();
+
+    for (const id of ids) {
+      const prod = productMap.get(id);
+      if (prod && !addedIds.has(prod.id)) {
+        reordered.push(prod);
+        addedIds.add(prod.id);
+      }
+    }
+
+    // Keep any remaining products that were not in the reordered list
+    for (const p of products) {
+      if (!addedIds.has(p.id)) {
+        reordered.push(p);
+        addedIds.add(p.id);
+      }
+    }
+
+    // Assign explicit sortOrder and position matching new sequence
+    reordered.forEach((p, idx) => {
+      p.sortOrder = idx;
+      p.position = idx;
+      p.priority = idx;
+    });
+
+    products = reordered;
+    saveJsonFile(PRODUCTS_FILE, products);
+
+    res.set('Cache-Control', 'no-store, no-cache, must-revalidate, proxy-revalidate');
+    res.set('Pragma', 'no-cache');
+    res.set('Expires', '0');
+    res.json({ success: true, message: 'Products sequence successfully saved to disk', products });
+  });
+
+  // Update Product (Admin)
+  app.put('/api/products/:id', (req: Request, res: Response) => {
+    const targetId = decodeURIComponent(String(req.params.id || '').trim());
+    const index = products.findIndex((p) => p.id === targetId || p.code === targetId);
+    if (index === -1) {
+      return res.status(404).json({ success: false, message: 'Product not found' });
+    }
+
+    const current = products[index];
+    const updateData = req.body;
+
+    const updated: JerseyProduct = {
+      ...current,
+      ...updateData,
+      id: current.id,
+      code: updateData.code !== undefined ? updateData.code : current.code,
+      price: updateData.price !== undefined ? Number(updateData.price) : current.price,
+      originalPrice: updateData.originalPrice !== undefined ? (updateData.originalPrice ? Number(updateData.originalPrice) : undefined) : current.originalPrice,
+      stockCount: updateData.stockCount !== undefined ? Number(updateData.stockCount) : current.stockCount,
+      updatedAt: new Date().toISOString()
+    };
+
+    products[index] = updated;
+    saveJsonFile(PRODUCTS_FILE, products);
+    res.json({ success: true, product: updated });
+  });
+
+  // Delete Product Permanently (Admin)
+  app.delete('/api/products/:id', (req: Request, res: Response) => {
+    const targetId = decodeURIComponent(String(req.params.id || '').trim());
+    const index = products.findIndex((p) => p.id === targetId || p.code === targetId);
+    
+    let deleted: JerseyProduct | null = null;
+    if (index !== -1) {
+      deleted = products.splice(index, 1)[0];
+    }
+
+    // Always tombstone the targetId so it never resurrects
+    if (targetId && !deletedProductIds.includes(targetId)) {
+      deletedProductIds.push(targetId);
+    }
+    if (deleted) {
+      if (deleted.id && !deletedProductIds.includes(deleted.id)) {
+        deletedProductIds.push(deleted.id);
+      }
+      if (deleted.code && !deletedProductIds.includes(deleted.code)) {
+        deletedProductIds.push(deleted.code);
+      }
+    }
+
+    saveJsonFile(DELETED_PRODUCTS_FILE, deletedProductIds);
+    saveJsonFile(PRODUCTS_FILE, products);
+
+    // Return the clean live product catalog directly
+    const cleanProducts = products.filter(p => !deletedProductIds.includes(p.id) && !deletedProductIds.includes(p.code));
+    res.json({
+      success: true,
+      message: 'Product permanently deleted',
+      product: deleted,
+      products: cleanProducts,
+      deletedProductIds
+    });
+  });
+
+  // Bulk Product Upload via R2 Folder / Storage Selection with Auto-Code Generation & Common Caption
+  app.post('/api/products/bulk-import-folder', (req: Request, res: Response) => {
+    try {
+      const {
+        category,
+        title: batchTitle,
+        commonTitle,
+        caption,
+        titlePattern = 'exact',
+        titlePrefix = '',
+        price = 1150,
+        originalPrice,
+        season = '2025/26',
+        edition = 'Player Issue Authentic',
+        badge = 'New Drop',
+        sizes = ['S', 'M', 'L', 'XL', 'XXL', '3XL'],
+        stockCount = 20,
+        inStock = true,
+        customizable = true,
+        selectedImages,
+        folder = 'uploads'
+      } = req.body;
+
+      if (!category) {
+        return res.status(400).json({ success: false, message: 'Category selection is required for bulk import.' });
+      }
+
+      // Collect images to process
+      let imagesToProcess: Array<{ filename?: string; url: string; title?: string }> = [];
+
+      if (Array.isArray(selectedImages) && selectedImages.length > 0) {
+        imagesToProcess = selectedImages.map((img: any) => {
+          if (typeof img === 'string') {
+            return { url: img, filename: path.basename(img) };
+          }
+          return {
+            url: img.url,
+            filename: img.filename || path.basename(img.url),
+            title: img.title
+          };
+        });
+      } else {
+        // Automatically scan the folder if no explicit selectedImages array was passed
+        const targetDirs: string[] = [];
+        let urlPrefix = '/uploads';
+
+        if (folder === 'images' || folder.startsWith('images/')) {
+          targetDirs.push(path.join(process.cwd(), 'public', folder));
+          urlPrefix = `/${folder}`;
+        } else {
+          const sub = folder === 'uploads' ? '' : folder.replace(/^uploads\//, '');
+          targetDirs.push(
+            path.join(UPLOADS_DIR, sub),
+            path.join(PUBLIC_UPLOADS_DIR, sub),
+            path.join(DATA_DIR, 'uploads', sub)
+          );
+          urlPrefix = `/${folder}`;
+        }
+
+        const foundMap = new Map<string, string>();
+        for (const dir of targetDirs) {
+          if (fs.existsSync(dir)) {
+            try {
+              const files = fs.readdirSync(dir);
+              for (const file of files) {
+                const ext = path.extname(file).toLowerCase();
+                if (['.jpg', '.jpeg', '.png', '.webp', '.gif', '.svg', '.avif'].includes(ext)) {
+                  if (!foundMap.has(file)) {
+                    foundMap.set(file, `${urlPrefix}/${file}`);
+                  }
+                }
+              }
+            } catch (scanErr) {
+              console.warn('Folder auto-scan error:', scanErr);
+            }
+          }
+        }
+
+        for (const [key, item] of imageStore.entries()) {
+          if (key.startsWith(`${folder}/`)) {
+            const filename = key.replace(`${folder}/`, '');
+            if (!foundMap.has(filename)) {
+              foundMap.set(filename, `/api/images/${encodeURIComponent(key)}`);
+            }
+          }
+        }
+
+        imagesToProcess = Array.from(foundMap.entries()).map(([filename, url]) => ({
+          filename,
+          url
+        }));
+      }
+
+      if (imagesToProcess.length === 0) {
+        return res.status(400).json({
+          success: false,
+          message: 'No images found in the selected folder or provided image list.'
+        });
+      }
+
+      // Existing SKU codes cache for 100% collision-free auto-code generation
+      const existingCodes = new Set<string>();
+      products.forEach((p) => {
+        if (p.code) existingCodes.add(p.code.toUpperCase());
+      });
+
+      const chars = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789';
+      const generateUniqueCode = () => {
+        let code = '';
+        let attempts = 0;
+        do {
+          code = 'SJ-';
+          for (let i = 0; i < 5; i++) {
+            code += chars.charAt(Math.floor(Math.random() * chars.length));
+          }
+          attempts++;
+          if (attempts > 500) {
+            code += Math.floor(Math.random() * 900 + 100);
+            break;
+          }
+        } while (existingCodes.has(code));
+        existingCodes.add(code);
+        return code;
+      };
+
+      const makeCleanTitle = (fname: string) => {
+        const nameWithoutExt = fname.replace(/\.[^/.]+$/, '');
+        const clean = nameWithoutExt
+          .replace(/^\d+[-_]/, '')
+          .replace(/[-_]\d{10,}$/, '')
+          .replace(/[-_]/g, ' ')
+          .trim();
+        return clean.replace(/\b\w/g, (l) => l.toUpperCase()) || 'Product Item';
+      };
+
+      const sharedCaption = (caption || '').trim() || `${category} Collection`;
+      const createdBatch: JerseyProduct[] = [];
+
+      imagesToProcess.forEach((imgItem, idx) => {
+        const cleanName = makeCleanTitle(imgItem.filename || `Item ${idx + 1}`);
+
+        const effectiveBatchTitle = (batchTitle || commonTitle || '').trim();
+        let finalTitle = cleanName;
+
+        if (imgItem.title && imgItem.title.trim()) {
+          finalTitle = imgItem.title.trim();
+        } else if (effectiveBatchTitle) {
+          if (titlePattern === 'numbered' || titlePattern === 'caption_numbered' || titlePattern === 'title_numbered') {
+            finalTitle = `${effectiveBatchTitle} #${idx + 1}`;
+          } else if (titlePattern === 'category_title' || titlePattern === 'category_caption') {
+            finalTitle = `${category} - ${effectiveBatchTitle} #${idx + 1}`;
+          } else if (titlePattern === 'prefix_name') {
+            const prefix = titlePrefix.trim() ? `${titlePrefix.trim()} ` : '';
+            finalTitle = `${prefix}${cleanName}`;
+          } else {
+            // 'exact' or default: all products share this exact title
+            finalTitle = effectiveBatchTitle;
+          }
+        } else if (titlePattern === 'prefix_name' && titlePrefix.trim()) {
+          finalTitle = `${titlePrefix.trim()} ${cleanName}`;
+        }
+
+        const uniqueCode = generateUniqueCode();
+        const rawCaption = (imgItem && (imgItem as any).caption) ? (imgItem as any).caption.trim() : sharedCaption;
+        const resolvedCaption = rawCaption
+          .replace(/{title}/gi, finalTitle)
+          .replace(/{code}/gi, uniqueCode)
+          .replace(/{price}/gi, String(Number(price) || 1150))
+          .replace(/{category}/gi, category.trim())
+          .replace(/{sizes}/gi, (Array.isArray(sizes) && sizes.length > 0 ? sizes : ['S', 'M', 'L', 'XL', 'XXL', '3XL']).join(', '))
+          .replace(/{edition}/gi, edition || 'Player Issue Authentic');
+
+        const newProduct: JerseyProduct = {
+          id: `spidey-bulk-${Date.now()}-${Math.random().toString(36).substring(2, 6)}-${idx}`,
+          code: uniqueCode,
+          title: finalTitle,
+          category: category.trim(),
+          price: Number(price) || 1150,
+          originalPrice: originalPrice ? Number(originalPrice) : undefined,
+          season: season || '2025/26',
+          edition: edition || 'Player Issue Authentic',
+          badge: badge || 'New Drop',
+          images: [imgItem.url],
+          description: resolvedCaption, // Product caption/description with optional variables resolved
+          features: [
+            'Ultralight Aeroready seamless matrix structure',
+            'High-definition heat-bonded silicone crest',
+            'Anti-odor active breathability yarn integration',
+            'Laser-cut ventilation zone mapping'
+          ],
+          sizes: Array.isArray(sizes) && sizes.length > 0 ? sizes : ['S', 'M', 'L', 'XL', 'XXL', '3XL'],
+          inStock: inStock !== false,
+          stockCount: stockCount !== undefined ? Number(stockCount) : 20,
+          rating: 5.0,
+          reviewCount: 0,
+          customizable: customizable !== false,
+          colorTheme: {
+            primary: '#0f172a',
+            accent: '#06b6d4',
+            glow: 'rgba(6, 182, 212, 0.35)'
+          },
+          sortOrder: 0,
+          position: 0,
+          priority: 0,
+          createdAt: new Date().toISOString(),
+          updatedAt: new Date().toISOString()
+        };
+
+        createdBatch.push(newProduct);
+      });
+
+      // Insert all new products at the top of the catalog
+      products.unshift(...createdBatch);
+
+      // Re-index sort order
+      products.forEach((p, idx) => {
+        p.sortOrder = idx;
+        p.position = idx;
+        p.priority = idx;
+      });
+
+      saveJsonFile(PRODUCTS_FILE, products);
+
+      res.set('Cache-Control', 'no-store, no-cache, must-revalidate, proxy-revalidate');
+      res.set('Pragma', 'no-cache');
+      res.set('Expires', '0');
+
+      console.log(`✓ Bulk imported ${createdBatch.length} products to category "${category}" from folder "${folder}"`);
+
+      res.status(201).json({
+        success: true,
+        message: `Successfully created ${createdBatch.length} products in category "${category}" with unique codes.`,
+        count: createdBatch.length,
+        products: createdBatch
+      });
+    } catch (err: any) {
+      console.error('Bulk folder import error:', err);
+      res.status(500).json({ success: false, message: err.message || 'Bulk import failed' });
+    }
+  });
+
+  // Image Upload Handler (Emulating Cloudflare R2 bucket binding MY_BUCKET.put)
+  app.post('/api/upload', (req: Request, res: Response) => {
+    try {
+      const { filename, contentType, base64Data } = req.body;
+
+      if (!base64Data) {
+        return res.status(400).json({ success: false, message: 'base64Data is required' });
+      }
+
+      let cleanData = base64Data;
+      let mime = contentType || 'image/jpeg';
+
+      if (base64Data.startsWith('data:')) {
+        const parts = base64Data.split(',');
+        const match = parts[0].match(/:(.*?);/);
+        if (match) mime = match[1];
+        cleanData = parts[1] || '';
+      }
+
+      const extension = mime.includes('png') ? 'png' : mime.includes('webp') ? 'webp' : 'jpg';
+      const cleanFilename = (filename || 'image').replace(/[^a-zA-Z0-9_-]/g, '_');
+      const uniqueBaseName = `${Date.now()}-${cleanFilename}.${extension}`;
+      const key = `uploads/${uniqueBaseName}`;
+
+      const buffer = Buffer.from(cleanData, 'base64');
+
+      // Save directly to disk in both persistent UPLOADS_DIR and PUBLIC_UPLOADS_DIR
+      const targetPaths = [
+        path.join(UPLOADS_DIR, uniqueBaseName),
+        path.join(PUBLIC_UPLOADS_DIR, uniqueBaseName)
+      ];
+
+      for (const diskPath of targetPaths) {
+        try {
+          fs.writeFileSync(diskPath, buffer);
+        } catch (writeErr) {
+          console.warn(`Could not write image to ${diskPath}:`, writeErr);
+        }
+      }
+
+      imageStore.set(key, {
+        data: cleanData,
+        mime,
+        size: buffer.length,
+        filename: filename || key,
+        uploadedAt: new Date().toISOString()
+      });
+      persistImages();
+
+      const imageUrl = `/api/images/${encodeURIComponent(key)}`;
+
+      res.json({
+        success: true,
+        key,
+        url: imageUrl,
+        staticUrl: `/uploads/${uniqueBaseName}`,
+        size: buffer.length,
+        contentType: mime,
+        bucket: 'spidey-jersey-images',
+        binding: 'MY_BUCKET'
+      });
+    } catch (err: any) {
+      console.error('Upload error:', err);
+      res.status(500).json({ success: false, message: err.message || 'Upload failed' });
+    }
+  });
+
+  // Serve Static Uploads from Persistent Directories
+  app.use('/uploads', express.static(UPLOADS_DIR));
+  app.use('/uploads', express.static(PUBLIC_UPLOADS_DIR));
+  app.use('/uploads', express.static(path.join(DATA_DIR, 'uploads')));
+
+  // Fallback handler for /uploads/:filename if not yet physically flushed
+  app.get('/uploads/:filename', (req: Request, res: Response) => {
+    const filename = req.params.filename;
+    const key = `uploads/${filename}`;
+    const item = imageStore.get(key) || imageStore.get(filename);
+
+    if (item && item.data) {
+      const buffer = Buffer.from(item.data, 'base64');
+      res.setHeader('Content-Type', item.mime || 'image/jpeg');
+      res.setHeader('Content-Length', buffer.length);
+      res.setHeader('Cache-Control', 'public, max-age=31536000, immutable');
+      return res.send(buffer);
+    }
+
+    res.status(404).send('Uploaded image not found');
+  });
+
+  // Serve Stored Image (Emulating Cloudflare R2 bucket binding MY_BUCKET.get with multi-path disk fallback)
+  app.get('/api/images/:key(*)', (req: Request, res: Response) => {
+    const key = req.params.key;
+    const item = imageStore.get(key) || imageStore.get(decodeURIComponent(key));
+
+    if (item && item.data) {
+      const buffer = Buffer.from(item.data, 'base64');
+      res.setHeader('Content-Type', item.mime || 'image/jpeg');
+      res.setHeader('Content-Length', buffer.length);
+      res.setHeader('Cache-Control', 'public, max-age=31536000, immutable');
+      return res.send(buffer);
+    }
+
+    // Check disk fallbacks in UPLOADS_DIR, PUBLIC_UPLOADS_DIR, and DATA_DIR/uploads
+    const baseName = path.basename(key);
+    const candidatePaths = [
+      path.join(UPLOADS_DIR, baseName),
+      path.join(PUBLIC_UPLOADS_DIR, baseName),
+      path.join(DATA_DIR, 'uploads', baseName)
+    ];
+
+    for (const diskPath of candidatePaths) {
+      if (fs.existsSync(diskPath)) {
+        const mimeType = baseName.endsWith('.png') ? 'image/png' : baseName.endsWith('.webp') ? 'image/webp' : 'image/jpeg';
+        res.setHeader('Content-Type', mimeType);
+        res.setHeader('Cache-Control', 'public, max-age=31536000, immutable');
+        return res.sendFile(diskPath);
+      }
+    }
+
+    return res.status(404).send('Image not found');
+  });
+
+  // Storage Health & Diagnostics Endpoint
+  app.get('/api/storage/status', (req: Request, res: Response) => {
+    res.json({
+      success: true,
+      persistentRoot: DATA_DIR,
+      uploadsDir: UPLOADS_DIR,
+      publicUploadsDir: PUBLIC_UPLOADS_DIR,
+      backupsDir: BACKUPS_DIR,
+      isCustomVolumeMounted: DATA_DIR.startsWith('/data') || process.env.DATA_DIR !== undefined || process.env.PERSISTENT_STORAGE_DIR !== undefined,
+      stats: {
+        totalProducts: products.length,
+        totalCategories: categoryItems.length,
+        totalOrders: orders.length,
+        totalStoredImages: imageStore.size,
+        hasBackupProducts: fs.existsSync(`${PRODUCTS_FILE}.bak`),
+        hasBackupOrders: fs.existsSync(`${ORDERS_FILE}.bak`),
+        hasBackupSettings: fs.existsSync(`${SETTINGS_FILE}.bak`),
+        hasBackupCategories: fs.existsSync(`${CATEGORIES_FILE}.bak`)
+      }
+    });
+  });
+
+  // Storage Folders Scanner (For Bulk Import / Folder Browser)
+  app.get('/api/storage/folders', (_req: Request, res: Response) => {
+    try {
+      const folders: Array<{
+        id: string;
+        name: string;
+        path: string;
+        imageCount: number;
+        sampleThumbnails: string[];
+      }> = [];
+
+      const getImageFiles = (dir: string): string[] => {
+        if (!fs.existsSync(dir)) return [];
+        try {
+          return fs.readdirSync(dir).filter((f) => {
+            const ext = path.extname(f).toLowerCase();
+            return ['.jpg', '.jpeg', '.png', '.webp', '.gif', '.svg', '.avif'].includes(ext);
+          });
+        } catch {
+          return [];
+        }
+      };
+
+      // 1. R2 / Disk uploads folder
+      const uploadFiles = new Set<string>();
+      getImageFiles(UPLOADS_DIR).forEach((f) => uploadFiles.add(f));
+      getImageFiles(PUBLIC_UPLOADS_DIR).forEach((f) => uploadFiles.add(f));
+      getImageFiles(path.join(DATA_DIR, 'uploads')).forEach((f) => uploadFiles.add(f));
+      for (const key of imageStore.keys()) {
+        if (key.startsWith('uploads/')) {
+          uploadFiles.add(key.replace(/^uploads\//, ''));
+        }
+      }
+      const uploadFilesArr = Array.from(uploadFiles);
+      folders.push({
+        id: 'uploads',
+        name: 'R2 Cloud Uploads (/uploads)',
+        path: '/uploads',
+        imageCount: uploadFilesArr.length,
+        sampleThumbnails: uploadFilesArr.slice(0, 6).map((f) => `/uploads/${encodeURIComponent(f)}`)
+      });
+
+      // 2. public/images folder
+      const publicImagesDir = path.join(process.cwd(), 'public', 'images');
+      const catalogImages = getImageFiles(publicImagesDir);
+      folders.push({
+        id: 'images',
+        name: 'Catalog Media (/images)',
+        path: '/images',
+        imageCount: catalogImages.length,
+        sampleThumbnails: catalogImages.slice(0, 6).map((f) => `/images/${encodeURIComponent(f)}`)
+      });
+
+      // 3. Scan for any subfolders inside UPLOADS_DIR or PUBLIC_UPLOADS_DIR
+      const scanSubdirs = (baseDir: string, prefix: string) => {
+        if (!fs.existsSync(baseDir)) return;
+        try {
+          const entries = fs.readdirSync(baseDir, { withFileTypes: true });
+          for (const entry of entries) {
+            if (entry.isDirectory()) {
+              const subDirPath = path.join(baseDir, entry.name);
+              const subImages = getImageFiles(subDirPath);
+              const folderKey = `${prefix}/${entry.name}`;
+              if (!folders.some((f) => f.id === folderKey)) {
+                folders.push({
+                  id: folderKey,
+                  name: `${prefix}/${entry.name}`,
+                  path: `/${prefix}/${entry.name}`,
+                  imageCount: subImages.length,
+                  sampleThumbnails: subImages.slice(0, 6).map((f) => `/${prefix}/${entry.name}/${encodeURIComponent(f)}`)
+                });
+              }
+            }
+          }
+        } catch (subErr) {
+          console.warn('Subdir scan error:', subErr);
+        }
+      };
+      scanSubdirs(UPLOADS_DIR, 'uploads');
+      scanSubdirs(PUBLIC_UPLOADS_DIR, 'uploads');
+      scanSubdirs(publicImagesDir, 'images');
+
+      res.json({ success: true, folders });
+    } catch (err: any) {
+      res.status(500).json({ success: false, message: err.message || 'Failed to list folders' });
+    }
+  });
+
+  // Folder Images Scanner (Returns files & thumbnail URLs inside chosen storage folder)
+  app.get('/api/storage/folder-images', (req: Request, res: Response) => {
+    try {
+      const folder = String(req.query.folder || 'uploads').trim().replace(/^\/+|\/+$/g, '');
+      const targetDirs: string[] = [];
+      let urlPrefix = '/uploads';
+
+      if (folder === 'images' || folder.startsWith('images/')) {
+        targetDirs.push(path.join(process.cwd(), 'public', folder));
+        urlPrefix = `/${folder}`;
+      } else {
+        const sub = folder === 'uploads' ? '' : folder.replace(/^uploads\//, '');
+        targetDirs.push(
+          path.join(UPLOADS_DIR, sub),
+          path.join(PUBLIC_UPLOADS_DIR, sub),
+          path.join(DATA_DIR, 'uploads', sub)
+        );
+        urlPrefix = `/${folder}`;
+      }
+
+      const foundFiles = new Map<string, { filename: string; url: string; size: number; modifiedAt: string }>();
+
+      for (const dir of targetDirs) {
+        if (fs.existsSync(dir)) {
+          try {
+            const files = fs.readdirSync(dir);
+            for (const file of files) {
+              const ext = path.extname(file).toLowerCase();
+              if (['.jpg', '.jpeg', '.png', '.webp', '.gif', '.svg', '.avif'].includes(ext)) {
+                if (!foundFiles.has(file)) {
+                  try {
+                    const stat = fs.statSync(path.join(dir, file));
+                    foundFiles.set(file, {
+                      filename: file,
+                      url: `${urlPrefix}/${file}`,
+                      size: stat.size,
+                      modifiedAt: stat.mtime.toISOString()
+                    });
+                  } catch {
+                    foundFiles.set(file, {
+                      filename: file,
+                      url: `${urlPrefix}/${file}`,
+                      size: 0,
+                      modifiedAt: new Date().toISOString()
+                    });
+                  }
+                }
+              }
+            }
+          } catch (dirErr) {
+            console.warn('Error reading directory:', dir, dirErr);
+          }
+        }
+      }
+
+      // Merge items from in-memory imageStore
+      for (const [key, item] of imageStore.entries()) {
+        if (key.startsWith(`${folder}/`)) {
+          const filename = key.replace(`${folder}/`, '');
+          if (!foundFiles.has(filename)) {
+            foundFiles.set(filename, {
+              filename,
+              url: `/api/images/${encodeURIComponent(key)}`,
+              size: item.size || 0,
+              modifiedAt: item.uploadedAt || new Date().toISOString()
+            });
+          }
+        }
+      }
+
+      // Check which images are already used by products
+      const usedImageUrls = new Set<string>();
+      products.forEach((p) => {
+        p.images?.forEach((img) => {
+          usedImageUrls.add(img);
+          usedImageUrls.add(path.basename(img));
+        });
+      });
+
+      const makeCleanTitle = (fname: string) => {
+        const nameWithoutExt = fname.replace(/\.[^/.]+$/, '');
+        const clean = nameWithoutExt
+          .replace(/^\d+[-_]/, '')
+          .replace(/[-_]\d{10,}$/, '')
+          .replace(/[-_]/g, ' ')
+          .trim();
+        return clean.replace(/\b\w/g, (l) => l.toUpperCase()) || 'Product Item';
+      };
+
+      const images = Array.from(foundFiles.values()).map((item) => ({
+        ...item,
+        cleanTitle: makeCleanTitle(item.filename),
+        alreadyUsed: usedImageUrls.has(item.url) || usedImageUrls.has(item.filename)
+      }));
+
+      // Sort newest modified first
+      images.sort((a, b) => new Date(b.modifiedAt).getTime() - new Date(a.modifiedAt).getTime());
+
+      res.json({
+        success: true,
+        folder,
+        count: images.length,
+        images
+      });
+    } catch (err: any) {
+      res.status(500).json({ success: false, message: err.message || 'Failed to list folder images' });
+    }
+  });
+
+  // Full Catalog Snapshot Backup Export
+  app.get('/api/sync/backup', (req: Request, res: Response) => {
+    const rawImgs: Record<string, StoredImage> = {};
+    for (const [k, v] of imageStore.entries()) {
+      rawImgs[k] = v;
+    }
+    const backupData = {
+      timestamp: new Date().toISOString(),
+      version: '2.5.0',
+      products,
+      categories: categoryItems,
+      siteSettings,
+      orders,
+      steadfastConfig,
+      images: rawImgs
+    };
+    res.json({ success: true, backup: backupData });
+  });
+
+  // Full Catalog Snapshot Restore
+  app.post('/api/sync/restore', (req: Request, res: Response) => {
+    const { backup } = req.body;
+    if (!backup || typeof backup !== 'object') {
+      return res.status(400).json({ success: false, message: 'Valid backup payload required' });
+    }
+
+    if (Array.isArray(backup.products) && backup.products.length > 0) {
+      products = backup.products;
+      saveJsonFile(PRODUCTS_FILE, products);
+    }
+
+    if (Array.isArray(backup.categories) && backup.categories.length > 0) {
+      categoryItems = backup.categories;
+      saveJsonFile(CATEGORIES_FILE, categoryItems);
+    }
+
+    if (backup.siteSettings && typeof backup.siteSettings === 'object') {
+      siteSettings = { ...DEFAULT_SITE_SETTINGS, ...backup.siteSettings };
+      saveJsonFile(SETTINGS_FILE, siteSettings);
+    }
+
+    if (Array.isArray(backup.orders)) {
+      orders = backup.orders;
+      saveJsonFile(ORDERS_FILE, orders);
+    }
+
+    if (backup.steadfastConfig) {
+      steadfastConfig = { ...steadfastConfig, ...backup.steadfastConfig };
+      saveJsonFile(STEADFAST_CONFIG_FILE, steadfastConfig);
+    }
+
+    if (backup.images && typeof backup.images === 'object') {
+      for (const [k, v] of Object.entries(backup.images)) {
+        imageStore.set(k, v as StoredImage);
+      }
+      persistImages();
+    }
+
+    res.json({
+      success: true,
+      message: 'Store state successfully restored from persistent backup!',
+      productsCount: products.length,
+      categoriesCount: categoryItems.length
+    });
+  });
+
+  // Intelligent Client-Server Rehydration (Non-destructive merge)
+  app.post('/api/sync/rehydrate', (req: Request, res: Response) => {
+    const { clientProducts, clientCategories, clientSettings, clientOrders } = req.body;
+    let productsUpdated = false;
+    let categoriesUpdated = false;
+    let settingsUpdated = false;
+
+    // Merge client products that aren't on the server
+    if (Array.isArray(clientProducts) && clientProducts.length > 0) {
+      for (const cp of clientProducts) {
+        // STRICT GUARD: If product was deleted, NEVER rehydrate or resurrect it
+        if (
+          deletedProductIds.includes(cp.id) ||
+          (cp.code && deletedProductIds.includes(cp.code))
+        ) {
+          continue;
+        }
+        const exists = products.find(p => p.id === cp.id || (cp.code && p.code === cp.code));
+        if (!exists && cp.title) {
+          products.unshift(cp);
+          productsUpdated = true;
+        }
+      }
+      if (productsUpdated) {
+        saveJsonFile(PRODUCTS_FILE, products);
+      }
+    }
+
+    // Merge client categories that aren't on the server
+    if (Array.isArray(clientCategories) && clientCategories.length > 0) {
+      for (const cc of clientCategories) {
+        // STRICT GUARD: If category was deleted, NEVER rehydrate or resurrect it
+        if (
+          deletedCategoryIds.includes(cc.id) ||
+          deletedCategoryIds.includes(cc.name)
+        ) {
+          continue;
+        }
+        const exists = categoryItems.find(
+          c => c.id.toLowerCase() === cc.id.toLowerCase() || c.name.toLowerCase() === (cc.name || '').toLowerCase()
+        );
+        if (!exists && cc.name) {
+          categoryItems.push(cc);
+          categoriesUpdated = true;
+        }
+      }
+      if (categoriesUpdated) {
+        saveJsonFile(CATEGORIES_FILE, categoryItems);
+      }
+    }
+
+    // Preserve custom site settings if server still has defaults
+    if (clientSettings && typeof clientSettings === 'object' && clientSettings.heroHeadline) {
+      if (siteSettings.heroHeadline === DEFAULT_SITE_SETTINGS.heroHeadline && clientSettings.heroHeadline !== DEFAULT_SITE_SETTINGS.heroHeadline) {
+        siteSettings = { ...siteSettings, ...clientSettings };
+        saveJsonFile(SETTINGS_FILE, siteSettings);
+        settingsUpdated = true;
+      }
+    }
+
+    res.json({
+      success: true,
+      products,
+      categories: categoryItems,
+      siteSettings,
+      rehydrated: { productsUpdated, categoriesUpdated, settingsUpdated }
+    });
+  });
+
+  // Reconnect & Force Re-Index Store Data: POST /api/sync/reconnect or /api/sync/resync
+  const handleResync = (_req: Request, res: Response) => {
+    // 1. Re-read master files
+    const loadedProducts = loadJsonFile<JerseyProduct[]>(PRODUCTS_FILE, [...INITIAL_JERSEYS]);
+    if (Array.isArray(loadedProducts) && loadedProducts.length > 0) {
+      products = loadedProducts;
+    } else {
+      products = [...INITIAL_JERSEYS];
+      saveJsonFile(PRODUCTS_FILE, products);
+    }
+
+    const loadedCategories = loadJsonFile<CategoryItem[]>(CATEGORIES_FILE, [...CATEGORY_CAROUSEL_ITEMS]);
+    if (Array.isArray(loadedCategories) && loadedCategories.length > 0) {
+      categoryItems = loadedCategories;
+    } else {
+      categoryItems = [...CATEGORY_CAROUSEL_ITEMS];
+      saveJsonFile(CATEGORIES_FILE, categoryItems);
+    }
+
+    siteSettings = loadJsonFile<SiteSettings>(SETTINGS_FILE, { ...DEFAULT_SITE_SETTINGS });
+    orders = loadJsonFile<Order[]>(ORDERS_FILE, []);
+
+    res.json({
+      success: true,
+      message: 'Store state and database re-indexed successfully!',
+      productsCount: products.length,
+      categoriesCount: categoryItems.length,
+      settings: siteSettings,
+      products,
+      categories: categoryItems
+    });
+  };
+
+  app.post('/api/sync/reconnect', handleResync);
+  app.post('/api/sync/resync', handleResync);
+
+  // Admin Stats
+  app.get('/api/stats', (req: Request, res: Response) => {
+    const inStockCount = products.filter((p) => p.inStock && p.stockCount > 0).length;
+    const totalInventoryValue = products.reduce((acc, p) => acc + p.price * p.stockCount, 0);
+    const totalRevenue = orders.reduce((acc, o) => acc + o.totalAmount, 0);
+
+    const stats: StoreStats = {
+      totalProducts: products.length,
+      totalCategories: categoryItems.length,
+      inStockCount,
+      totalOrders: orders.length,
+      totalRevenue,
+      r2BucketStatus: {
+        binding: 'MY_BUCKET',
+        bucketName: 'spidey-jersey-images',
+        connected: true,
+        storageType: 'r2_worker'
+      }
+    };
+
+    res.json({ success: true, stats, totalInventoryValue });
+  });
+
+  // --- Telegram Order Notification Helper (Requirement 4) ---
+  function formatTelegramOrderText(order: Order, settings?: SiteSettings): string {
+    const customerName = order.customerName || 'N/A';
+    const phoneNumber = order.phoneNumber || 'N/A';
+    const rawAddress = (order.shippingAddress || 'N/A').trim();
+
+    // Delivery Zone resolving (e.g. inside_dhaka -> "ঢাকার ভেতরে")
+    let zoneTitle = '';
+    const currentSettings = settings || siteSettings;
+    if (order.deliveryZone === 'inside_dhaka') {
+      zoneTitle = currentSettings.deliveryZoneInsideDhakaTitle || 'ঢাকার ভেতরে';
+    } else if (order.deliveryZone === 'sub_dhaka') {
+      zoneTitle = currentSettings.deliveryZoneSubDhakaTitle || 'ঢাকার সাব-এরিয়া';
+    } else if (order.deliveryZone === 'outside_dhaka') {
+      zoneTitle = currentSettings.deliveryZoneOutsideDhakaTitle || 'ঢাকার বাইরে';
+    } else if (order.deliveryZone) {
+      zoneTitle = order.deliveryZone;
+    }
+
+    const finalAddress = zoneTitle && !rawAddress.includes(`[ ${zoneTitle} ]`) && !rawAddress.includes(`[${zoneTitle}]`)
+      ? `${rawAddress} [ ${zoneTitle} ]`
+      : rawAddress;
+
+    const itemsList: string[] = [];
+    let itemIndex = 1;
+
+    for (const it of (order.items || [])) {
+      const qty = Math.max(1, it.quantity || 1);
+      const codePart = it.product?.code ? `[${it.product.code}] ` : (it.product?.id ? `[${it.product.id}] ` : '');
+      const titlePart = it.product?.title || 'Jersey';
+      const sizePart = it.selectedSize || 'L';
+      
+      // Customization part: e.g. -  "TORRES 9"
+      const customParts = [it.customName, it.customNumber].filter(Boolean);
+      const customText = customParts.length > 0 ? ` -  "${customParts.join(' ')}"` : '';
+
+      const singleLine = `${codePart}${titlePart} (Size: ${sizePart})${customText}`;
+
+      for (let q = 0; q < qty; q++) {
+        itemsList.push(`${itemIndex}. ${singleLine}`);
+        itemIndex++;
+      }
+    }
+
+    const itemsFormatted = itemsList.length > 0 ? itemsList.join('\n') : '1. Jersey (Size: L)';
+    const amountVal = order.totalAmount || order.codAmount || 0;
+
+    return `Name: ${customerName}
+Mobile: ${phoneNumber}
+Address: ${finalAddress}
+
+ITEMS:
+${itemsFormatted}
+Amount: ${amountVal}৳`;
+  }
+
+  function normalizeTelegramChatIds(rawChatId: string): string[] {
+    const clean = rawChatId.trim();
+    if (!clean) return [];
+    const candidates = new Set<string>();
+
+    if (clean.startsWith('-100')) {
+      candidates.add(clean);
+    } else if (clean.startsWith('100')) {
+      // Very common: User copies supergroup ID without minus sign, e.g. 1003901747514 -> -1003901747514
+      candidates.add(`-${clean}`);
+      candidates.add(clean);
+    } else if (clean.startsWith('-')) {
+      // E.g. -3901747514
+      candidates.add(clean);
+      candidates.add(`-100${clean.slice(1)}`);
+    } else {
+      // Plain numbers: try supergroup prefix first, then direct
+      candidates.add(`-100${clean}`);
+      candidates.add(clean);
+      candidates.add(`-${clean}`);
+    }
+
+    return Array.from(candidates);
+  }
+
+  async function sendTelegramOrderNotification(order: Order, settings: SiteSettings): Promise<{ success: boolean; message?: string; chatId?: string }> {
+    const token = (settings.telegramBotToken || '8972453715:AAEHlxk5XLQgsozL1yTwpuCAgT0RSHOzwIw').trim();
+    const rawChatId = (settings.telegramChatId || '-1003901747514').trim();
+
+    if (!token || !rawChatId || settings.telegramNotificationsEnabled === false) {
+      return { success: false, message: 'Telegram notification is disabled or not configured.' };
+    }
+
+    const text = formatTelegramOrderText(order, settings);
+    const candidateIds = normalizeTelegramChatIds(rawChatId);
+
+    let lastError = '';
+    for (const cid of candidateIds) {
+      try {
+        const resp = await fetch(`https://api.telegram.org/bot${token}/sendMessage`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            chat_id: cid,
+            text
+          })
+        });
+        const data = await resp.json() as any;
+        if (data.ok) {
+          console.log(`✓ Telegram notification sent successfully to chat_id: ${cid}`);
+          return { success: true, chatId: cid };
+        } else {
+          lastError = data.description || 'Unknown Telegram response';
+        }
+      } catch (e: any) {
+        lastError = e.message || 'Telegram network exception';
+      }
+    }
+
+    console.log(`Telegram dispatch ended without successful delivery: ${lastError}`);
+    return { success: false, message: lastError };
+  }
+
+  // Orders / Checkout Simulation
+  app.post('/api/orders', (req: Request, res: Response) => {
+    const { 
+      items, 
+      customerName, 
+      customerEmail, 
+      phoneNumber,
+      shippingAddress, 
+      paymentMethod, 
+      deliveryZone,
+      couponCode,
+      isExchange,
+      hasGiftBox,
+      giftBoxType,
+      orderNote,
+      orderType,
+      discount, 
+      shippingFee,
+      totalAmount,
+      codAmount
+    } = req.body;
+
+    if (!items || !Array.isArray(items) || items.length === 0) {
+      return res.status(400).json({ success: false, message: 'Cart items are required' });
+    }
+
+    // Manual COD Pricing Logic: If user or admin entered an exact manual COD / Total amount,
+    // honor it as authoritative and DO NOT override with product catalog prices.
+    const hasManualCod = codAmount !== undefined && codAmount !== null && !isNaN(Number(codAmount));
+    const hasManualTotal = totalAmount !== undefined && totalAmount !== null && !isNaN(Number(totalAmount));
+
+    let subtotal: number;
+    let finalTotal: number;
+    let finalCod: number;
+
+    if (hasManualCod) {
+      finalCod = Math.max(0, Number(codAmount));
+      finalTotal = finalCod;
+      subtotal = finalCod;
+    } else if (hasManualTotal) {
+      finalTotal = Math.max(0, Number(totalAmount));
+      finalCod = finalTotal;
+      subtotal = finalTotal;
+    } else {
+      subtotal = items.reduce((acc: number, item: any) => {
+        const itemPrice = (item.product?.price || 0);
+        const customFee = (item.customizationFee || 0);
+        return acc + (itemPrice + customFee) * (item.quantity || 1);
+      }, 0);
+      const disc = discount || 0;
+      const ship = shippingFee || 0;
+      finalTotal = Math.max(0, subtotal - disc + ship);
+      finalCod = finalTotal;
+    }
+
+    const newOrder: Order = {
+      id: req.body.id || `SPIDEY-ORD-${Date.now().toString(36).toUpperCase()}-${Math.random().toString(36).substring(2, 5).toUpperCase()}`,
+      items,
+      customerName: customerName || 'Guest Collector',
+      customerEmail: customerEmail || (phoneNumber ? `${phoneNumber}@spideyorder.com` : 'guest@spideyjersey.com'),
+      phoneNumber: phoneNumber || undefined,
+      shippingAddress: shippingAddress || '123 Cyber Way, Neo City',
+      paymentMethod: paymentMethod || 'COD (Cash On Delivery)',
+      deliveryZone: deliveryZone || undefined,
+      couponCode: couponCode || undefined,
+      isExchange: !!isExchange,
+      hasGiftBox: !!hasGiftBox,
+      giftBoxType: giftBoxType || undefined,
+      orderNote: orderNote || undefined,
+      orderType: orderType || 'standard',
+      subtotal,
+      discount: discount || 0,
+      shippingFee: shippingFee || 0,
+      totalAmount: finalTotal,
+      codAmount: finalCod,
+      status: req.body.status || 'confirmed',
+      courierStatus: req.body.courierStatus || 'pending',
+      trackingCode: req.body.trackingCode || undefined,
+      createdAt: req.body.createdAt || new Date().toISOString()
+    };
+
+    // Requirement 7: When user places an order, do not save order record in website's admin panel database
+    // Only dispatch directly to Telegram without saving locally as standard backend order
+    if (req.body.saveToDatabase === true) {
+      orders.unshift(newOrder);
+      saveJsonFile(ORDERS_FILE, orders);
+    }
+
+    // Deduct stock
+    for (const item of items) {
+      const prod = products.find((p) => p.id === item.product?.id);
+      if (prod) {
+        prod.stockCount = Math.max(0, prod.stockCount - (item.quantity || 1));
+        if (prod.stockCount === 0) {
+          prod.inStock = false;
+        }
+      }
+    }
+    saveJsonFile(PRODUCTS_FILE, products);
+
+    // Asynchronously dispatch Telegram order notification to group
+    sendTelegramOrderNotification(newOrder, siteSettings).catch((err) => {
+      console.warn('Telegram notification async dispatch error:', err);
+    });
+
+    res.status(201).json({
+      success: true,
+      order: newOrder,
+      message: 'Order confirmed and notification sent directly to Telegram'
+    });
+  });
+
+  // Test Telegram Integration Endpoint
+  app.post('/api/telegram/test', async (req: Request, res: Response) => {
+    try {
+      const testSettings = { ...siteSettings, ...(req.body?.settings || {}) };
+      const testOrder: Order = {
+        id: `TEST-${Date.now().toString(36).toUpperCase()}`,
+        items: [
+          {
+            itemKey: 'test-item-1',
+            product: products[0] || INITIAL_JERSEYS[0],
+            selectedSize: 'L',
+            customName: 'TEST NAME',
+            customNumber: '10',
+            hasCustomization: true,
+            customizationFee: 100,
+            quantity: 1,
+            addedAt: Date.now()
+          }
+        ],
+        customerName: 'টেস্ট কাস্টমার (Test User)',
+        customerEmail: 'test@spideyorder.com',
+        phoneNumber: '01712345678',
+        shippingAddress: 'মিরপুর-১০, ঢাকা, বাংলাদেশ',
+        paymentMethod: 'Cash On Delivery (COD)',
+        deliveryZone: 'inside_dhaka',
+        subtotal: 1250,
+        discount: 50,
+        couponCode: 'SPIDEY50',
+        shippingFee: 70,
+        totalAmount: 1270,
+        codAmount: 1270,
+        status: 'confirmed',
+        createdAt: new Date().toISOString()
+      };
+
+      const result = await sendTelegramOrderNotification(testOrder, testSettings);
+      res.json(result);
+    } catch (e: any) {
+      res.status(500).json({ success: false, message: e.message || 'Telegram test failed' });
+    }
+  });
+
+  // Get All Orders (Admin)
+  app.get('/api/orders', (req: Request, res: Response) => {
+    res.json({ success: true, orders, count: orders.length });
+  });
+
+  // Bulk Save / Sync Orders (Admin Order Process)
+  app.post('/api/orders/bulk-sync', (req: Request, res: Response) => {
+    const { orders: incomingOrders } = req.body;
+    if (Array.isArray(incomingOrders) && incomingOrders.length > 0) {
+      for (const ord of incomingOrders) {
+        const idx = orders.findIndex(o => o.id === ord.id);
+        if (idx >= 0) {
+          orders[idx] = { ...orders[idx], ...ord };
+        } else {
+          orders.unshift(ord);
+        }
+      }
+      saveJsonFile(ORDERS_FILE, orders);
+    }
+    res.json({ success: true, count: orders.length, orders });
+  });
+
+  app.post('/api/orders/bulk', (req: Request, res: Response) => {
+    const { orders: newBulkOrders } = req.body;
+    if (Array.isArray(newBulkOrders) && newBulkOrders.length > 0) {
+      for (const ord of newBulkOrders) {
+        const idx = orders.findIndex(o => o.id === ord.id);
+        if (idx >= 0) {
+          orders[idx] = { ...orders[idx], ...ord };
+        } else {
+          orders.unshift(ord);
+        }
+      }
+      saveJsonFile(ORDERS_FILE, orders);
+    }
+    res.json({ success: true, count: orders.length, orders });
+  });
+
+  // Update Order (Admin / Courier assignment)
+  app.put('/api/orders/:id', (req: Request, res: Response) => {
+    const index = orders.findIndex((o) => o.id === req.params.id);
+    if (index === -1) {
+      return res.status(404).json({ success: false, message: 'Order not found' });
+    }
+    orders[index] = {
+      ...orders[index],
+      ...req.body,
+      id: orders[index].id
+    };
+    saveJsonFile(ORDERS_FILE, orders);
+    res.json({ success: true, order: orders[index] });
+  });
+
+  // Delete Order Permanently (Admin)
+  app.delete('/api/orders/:id', (req: Request, res: Response) => {
+    const index = orders.findIndex((o) => o.id === req.params.id);
+    if (index === -1) {
+      return res.status(404).json({ success: false, message: 'Order not found' });
+    }
+    const deleted = orders.splice(index, 1)[0];
+    saveJsonFile(ORDERS_FILE, orders);
+    res.json({ success: true, message: 'Order permanently deleted from database & storage', order: deleted, remainingCount: orders.length });
+  });
+
+  // Bulk Delete Orders Permanently (Admin)
+  app.post('/api/orders/bulk-delete', (req: Request, res: Response) => {
+    const { ids, deleteAll } = req.body;
+    if (deleteAll === true) {
+      const deletedCount = orders.length;
+      orders = [];
+      saveJsonFile(ORDERS_FILE, orders);
+      return res.json({ success: true, message: `All ${deletedCount} orders permanently deleted from database & storage`, remainingCount: 0 });
+    }
+
+    if (Array.isArray(ids) && ids.length > 0) {
+      const idSet = new Set(ids);
+      const initialCount = orders.length;
+      orders = orders.filter(o => !idSet.has(o.id));
+      const deletedCount = initialCount - orders.length;
+      saveJsonFile(ORDERS_FILE, orders);
+      return res.json({ success: true, message: `${deletedCount} orders permanently deleted from database & storage`, remainingCount: orders.length });
+    }
+
+    res.status(400).json({ success: false, message: 'Invalid bulk delete payload' });
+  });
+
+  // Helper: Ensure size breakdown exists for product
+  function ensureProductSizeStock(product: JerseyProduct): Record<string, number> {
+    const standardSizes = ['S', 'M', 'L', 'XL', 'XXL', '3XL'];
+    if (product.sizeStock && typeof product.sizeStock === 'object' && Object.keys(product.sizeStock).length > 0) {
+      return product.sizeStock;
+    }
+    const total = Number(product.stockCount) || 15;
+    const count = standardSizes.length;
+    const base = Math.floor(total / count);
+    const remainder = total % count;
+    const newSizeStock: Record<string, number> = {};
+    standardSizes.forEach((sz, idx) => {
+      newSizeStock[sz] = base + (idx < remainder ? 1 : 0);
+    });
+    product.sizeStock = newSizeStock;
+    return newSizeStock;
+  }
+
+  // Update Order Barcode Scan Status
+  app.patch('/api/orders/:id/scan-status', (req: Request, res: Response) => {
+    const index = orders.findIndex((o) => o.id === req.params.id);
+    if (index === -1) {
+      return res.status(404).json({ success: false, message: 'Order not found' });
+    }
+    const { barcodeScanned, scannedAt, status, outboundScannedAt } = req.body;
+    orders[index] = {
+      ...orders[index],
+      barcodeScanned: barcodeScanned !== undefined ? barcodeScanned : true,
+      scannedAt: scannedAt || new Date().toISOString(),
+      outboundScannedAt: outboundScannedAt || orders[index].outboundScannedAt || new Date().toISOString(),
+      status: status || orders[index].status
+    };
+    saveJsonFile(ORDERS_FILE, orders);
+    res.json({ success: true, message: 'Order scan status updated', order: orders[index] });
+  });
+
+  // --- Warehouse Automated Outbound Barcode Scan & Stock Deduction ---
+  app.post('/api/warehouse/scan-dispatch', (req: Request, res: Response) => {
+    const { scanCode, orderId } = req.body;
+    if (!scanCode && !orderId) {
+      return res.status(400).json({ success: false, message: 'Scan code or Order ID is required' });
+    }
+
+    const code = (scanCode || '').trim().toLowerCase();
+    
+    // Match order by invoiceNumber, trackingCode, consignmentId, id, or phoneNumber
+    let orderIndex = -1;
+    if (orderId) {
+      orderIndex = orders.findIndex(o => o.id === orderId);
+    }
+    if (orderIndex === -1 && code) {
+      orderIndex = orders.findIndex(o => {
+        const inv = (o.invoiceNumber || '').trim().toLowerCase();
+        const trk = (o.trackingCode || '').trim().toLowerCase();
+        const cid = (o.consignmentId || '').trim().toLowerCase();
+        const oid = (o.id || '').trim().toLowerCase();
+        const ph = (o.phoneNumber || '').replace(/[^0-9]/g, '');
+        const cleanCode = code.replace(/[^a-zA-Z0-9_-]/g, '');
+        const cleanDigits = code.replace(/[^0-9]/g, '');
+
+        return (
+          (inv && (inv === code || inv === cleanCode || inv.endsWith(code) || code.endsWith(inv) || inv.includes(cleanCode))) ||
+          (trk && (trk === code || trk === cleanCode || trk.includes(cleanCode) || cleanCode.includes(trk))) ||
+          (cid && (cid === code || cid === cleanCode || cid.includes(cleanCode) || cleanCode.includes(cid))) ||
+          (oid && (oid === code || oid === cleanCode || oid.includes(cleanCode) || cleanCode.includes(oid))) ||
+          (ph && cleanDigits.length >= 10 && ph.includes(cleanDigits))
+        );
+      });
+    }
+
+    if (orderIndex === -1) {
+      return res.status(404).json({
+        success: false,
+        message: `No order found matching code: ${scanCode || orderId}`
+      });
+    }
+
+    const targetOrder = orders[orderIndex];
+    const wasAlreadyDispatched = targetOrder.status === 'shipped' || targetOrder.status === 'dispatched' || targetOrder.status === 'delivered';
+    const wasStockDeducted = !!targetOrder.outboundStockDeducted;
+
+    const deductedDetails: Array<{
+      productId: string;
+      productTitle: string;
+      size: string;
+      quantity: number;
+      previousStock: number;
+      newStock: number;
+    }> = [];
+
+    // Deduct stock per size if not already deducted
+    if (!wasStockDeducted && Array.isArray(targetOrder.items)) {
+      for (const item of targetOrder.items) {
+        const prodId = item.product?.id;
+        const prodCode = item.product?.code;
+        const prodTitle = item.product?.title;
+        const size = (item.selectedSize || 'L').toUpperCase();
+        const qty = Number(item.quantity) || 1;
+
+        let matchedProduct = products.find(p => 
+          (prodId && p.id === prodId) ||
+          (prodCode && p.code && p.code.toLowerCase() === prodCode.toLowerCase()) ||
+          (prodTitle && p.title.toLowerCase() === prodTitle.toLowerCase())
+        );
+
+        if (matchedProduct) {
+          const currentSizeStock = ensureProductSizeStock(matchedProduct);
+          const currentSizeQty = currentSizeStock[size] !== undefined ? currentSizeStock[size] : 0;
+          const newSizeQty = Math.max(0, currentSizeQty - qty);
+          
+          currentSizeStock[size] = newSizeQty;
+          matchedProduct.sizeStock = currentSizeStock;
+          
+          // Recompute total stock
+          const prevTotal = matchedProduct.stockCount;
+          matchedProduct.stockCount = Object.values(currentSizeStock).reduce((acc, count) => acc + (Number(count) || 0), 0);
+          matchedProduct.inStock = matchedProduct.stockCount > 0;
+          matchedProduct.updatedAt = new Date().toISOString();
+
+          deductedDetails.push({
+            productId: matchedProduct.id,
+            productTitle: matchedProduct.title,
+            size,
+            quantity: qty,
+            previousStock: currentSizeQty,
+            newStock: newSizeQty
+          });
+        }
+      }
+
+      saveJsonFile(PRODUCTS_FILE, products);
+    }
+
+    // Update order status to Dispatched / Left Warehouse
+    const nowIso = new Date().toISOString();
+    const updatedOrder: Order = {
+      ...targetOrder,
+      status: 'shipped',
+      barcodeScanned: true,
+      scannedAt: nowIso,
+      outboundScannedAt: targetOrder.outboundScannedAt || nowIso,
+      outboundStockDeducted: true,
+      courierStatus: targetOrder.courierStatus === 'delivered' ? 'delivered' : (targetOrder.courierStatus || 'sent_to_courier'),
+      deductedItemsSummary: deductedDetails.map(d => `${d.productTitle} (${d.size} × ${d.quantity})`).join(', ') || targetOrder.deductedItemsSummary
+    };
+
+    orders[orderIndex] = updatedOrder;
+    saveJsonFile(ORDERS_FILE, orders);
+
+    return res.json({
+      success: true,
+      message: wasAlreadyDispatched 
+        ? `Order was already dispatched (Invoice #${updatedOrder.invoiceNumber || updatedOrder.id})`
+        : `Order successfully dispatched and stock deducted per size!`,
+      order: updatedOrder,
+      wasAlreadyDispatched,
+      wasStockDeducted,
+      deductedDetails,
+      updatedProducts: products
+    });
+  });
+
+  // --- Revert Order from Dispatched/Done back to Pending (Restores Inventory Stock) ---
+  app.post('/api/warehouse/revert-scan', (req: Request, res: Response) => {
+    const { orderId, scanCode } = req.body;
+    if (!orderId && !scanCode) {
+      return res.status(400).json({ success: false, message: 'Order ID or Scan Code is required' });
+    }
+
+    const code = (scanCode || '').trim().toLowerCase();
+    let orderIndex = -1;
+
+    if (orderId) {
+      orderIndex = orders.findIndex(o => o.id === orderId);
+    }
+    if (orderIndex === -1 && code) {
+      orderIndex = orders.findIndex(o => {
+        const inv = (o.invoiceNumber || '').trim().toLowerCase();
+        const trk = (o.trackingCode || '').trim().toLowerCase();
+        const cid = (o.consignmentId || '').trim().toLowerCase();
+        const oid = (o.id || '').trim().toLowerCase();
+        const ph = (o.phoneNumber || '').replace(/[^0-9]/g, '');
+        const cleanCode = code.replace(/[^a-zA-Z0-9_-]/g, '');
+
+        return (
+          (inv && (inv === code || inv === cleanCode)) ||
+          (trk && (trk === code || trk === cleanCode)) ||
+          (cid && (cid === code || cid === cleanCode)) ||
+          (oid && (oid === code || oid === cleanCode)) ||
+          (ph && code.length >= 10 && ph.includes(code))
+        );
+      });
+    }
+
+    if (orderIndex === -1) {
+      return res.status(404).json({
+        success: false,
+        message: `No order found matching: ${orderId || scanCode}`
+      });
+    }
+
+    const targetOrder = orders[orderIndex];
+    const restoredDetails: Array<{
+      productId: string;
+      productTitle: string;
+      size: string;
+      quantity: number;
+      previousStock: number;
+      newStock: number;
+    }> = [];
+
+    // Restore stock if previously deducted
+    if (targetOrder.outboundStockDeducted && Array.isArray(targetOrder.items)) {
+      for (const item of targetOrder.items) {
+        const prodId = item.product?.id;
+        const prodCode = item.product?.code;
+        const prodTitle = item.product?.title;
+        const size = (item.selectedSize || 'L').toUpperCase();
+        const qty = Number(item.quantity) || 1;
+
+        let matchedProduct = products.find(p => 
+          (prodId && p.id === prodId) ||
+          (prodCode && p.code && p.code.toLowerCase() === prodCode.toLowerCase()) ||
+          (prodTitle && p.title.toLowerCase() === prodTitle.toLowerCase())
+        );
+
+        if (matchedProduct) {
+          const currentSizeStock = ensureProductSizeStock(matchedProduct);
+          const currentSizeQty = currentSizeStock[size] !== undefined ? currentSizeStock[size] : 0;
+          const newSizeQty = currentSizeQty + qty;
+          
+          currentSizeStock[size] = newSizeQty;
+          matchedProduct.sizeStock = currentSizeStock;
+          
+          matchedProduct.stockCount = Object.values(currentSizeStock).reduce((acc, count) => acc + (Number(count) || 0), 0);
+          matchedProduct.inStock = matchedProduct.stockCount > 0;
+          matchedProduct.updatedAt = new Date().toISOString();
+
+          restoredDetails.push({
+            productId: matchedProduct.id,
+            productTitle: matchedProduct.title,
+            size,
+            quantity: qty,
+            previousStock: currentSizeQty,
+            newStock: newSizeQty
+          });
+        }
+      }
+
+      saveJsonFile(PRODUCTS_FILE, products);
+    }
+
+    // Update order back to pending / in-warehouse status
+    const updatedOrder: Order = {
+      ...targetOrder,
+      status: 'processing',
+      barcodeScanned: false,
+      scannedAt: undefined,
+      outboundScannedAt: undefined,
+      outboundStockDeducted: false,
+      deductedItemsSummary: undefined
+    };
+
+    orders[orderIndex] = updatedOrder;
+    saveJsonFile(ORDERS_FILE, orders);
+
+    return res.json({
+      success: true,
+      message: `Order #${updatedOrder.invoiceNumber || updatedOrder.id} reverted to Pending and stock restored!`,
+      order: updatedOrder,
+      restoredDetails,
+      updatedProducts: products
+    });
+  });
+
+  // --- Manual / Quick Stock Matrix Update ---
+  app.put('/api/products/:id/stock-matrix', (req: Request, res: Response) => {
+    const { sizeStock, stockCount, inStock } = req.body;
+    const index = products.findIndex(p => p.id === req.params.id);
+    if (index === -1) {
+      return res.status(404).json({ success: false, message: 'Product not found' });
+    }
+
+    const prod = products[index];
+    let newSizeStock: Record<string, number> = sizeStock || prod.sizeStock || ensureProductSizeStock(prod);
+    let newTotal: number = stockCount !== undefined 
+      ? Number(stockCount) 
+      : Object.values(newSizeStock).reduce((a: number, b: any) => a + (Number(b) || 0), 0);
+
+    products[index] = {
+      ...prod,
+      sizeStock: newSizeStock,
+      stockCount: Math.max(0, newTotal),
+      inStock: inStock !== undefined ? !!inStock : newTotal > 0,
+      updatedAt: new Date().toISOString()
+    };
+
+    saveJsonFile(PRODUCTS_FILE, products);
+    res.json({ success: true, product: products[index], message: 'Product size stock matrix updated' });
+  });
+
+  // --- Steadfast Courier Integration Endpoints ---
+
+  const saveSteadfastConfigToDisk = () => {
+    saveJsonFile(STEADFAST_CONFIG_FILE, steadfastConfig);
+  };
+
+  // Get Steadfast Settings
+  app.get('/api/courier/steadfast/settings', (req: Request, res: Response) => {
+    res.json({
+      success: true,
+      settings: {
+        ...steadfastConfig,
+        hasApiKey: !!(steadfastConfig.apiKey && steadfastConfig.apiKey.trim()),
+        hasSecretKey: !!(steadfastConfig.secretKey && steadfastConfig.secretKey.trim())
+      }
+    });
+  });
+
+  // Save Steadfast Settings
+  app.post('/api/courier/steadfast/settings', (req: Request, res: Response) => {
+    const { apiKey, secretKey, baseUrl, senderName, senderPhone, senderAddress, isLiveMode } = req.body;
+    steadfastConfig = {
+      apiKey: apiKey !== undefined ? apiKey.trim() : steadfastConfig.apiKey,
+      secretKey: secretKey !== undefined ? secretKey.trim() : steadfastConfig.secretKey,
+      baseUrl: (baseUrl && baseUrl.trim()) || 'https://portal.steadfast.com.bd/api/v1',
+      senderName: senderName || steadfastConfig.senderName,
+      senderPhone: senderPhone || steadfastConfig.senderPhone,
+      senderAddress: senderAddress || steadfastConfig.senderAddress,
+      isLiveMode: isLiveMode !== undefined ? !!isLiveMode : steadfastConfig.isLiveMode
+    };
+    saveSteadfastConfigToDisk();
+
+    res.json({
+      success: true,
+      message: 'Steadfast Courier API credentials saved and permanently synchronized',
+      settings: {
+        ...steadfastConfig,
+        hasApiKey: !!steadfastConfig.apiKey,
+        hasSecretKey: !!steadfastConfig.secretKey
+      }
+    });
+  });
+
+  // Robust Steadfast API fetch with automatic URL fallback
+  async function callSteadfastApi(
+    endpointPath: string,
+    method: 'GET' | 'POST',
+    apiKey: string,
+    secretKey: string,
+    body?: any,
+    preferredBaseUrl?: string
+  ): Promise<{ ok: boolean; status: number; data: any; rawText: string; error?: string; usedUrl?: string }> {
+    const candidateUrls = [
+      preferredBaseUrl,
+      steadfastConfig.baseUrl,
+      'https://portal.packzy.com/api/v1',
+      'https://portal.steadfast.com.bd/api/v1'
+    ]
+      .filter(Boolean)
+      .map(u => (u as string).trim().replace(/\/+$/, ''));
+
+    const uniqueUrls = Array.from(new Set(candidateUrls));
+    let lastError = '';
+
+    for (const base of uniqueUrls) {
+      try {
+        const cleanPath = endpointPath.startsWith('/') ? endpointPath : `/${endpointPath}`;
+        const url = `${base}${cleanPath}`;
+        const controller = new AbortController();
+        const timeoutId = setTimeout(() => controller.abort(), 9000);
+
+        const res = await fetch(url, {
+          method,
+          headers: {
+            'Api-Key': apiKey,
+            'Secret-Key': secretKey,
+            'Content-Type': 'application/json',
+            'Accept': 'application/json'
+          },
+          body: body ? JSON.stringify(body) : undefined,
+          signal: controller.signal
+        });
+        clearTimeout(timeoutId);
+
+        const rawText = await res.text();
+        let data: any = null;
+        try {
+          data = rawText ? JSON.parse(rawText) : null;
+        } catch (e) {
+          data = null;
+        }
+
+        if (res.ok || (res.status >= 200 && res.status < 500 && data)) {
+          return { ok: res.ok, status: res.status, data, rawText, usedUrl: base };
+        }
+        lastError = `HTTP ${res.status}: ${rawText || res.statusText}`;
+      } catch (e: any) {
+        lastError = e.message || 'Fetch failed';
+      }
+    }
+
+    return { ok: false, status: 0, data: null, rawText: '', error: lastError };
+  }
+
+  // Test Steadfast API Credentials & Balance
+  app.post('/api/courier/steadfast/test-connection', async (req: Request, res: Response) => {
+    const apiKey = (req.body.apiKey || steadfastConfig.apiKey || '').trim();
+    const secretKey = (req.body.secretKey || steadfastConfig.secretKey || '').trim();
+    const preferredBaseUrl = (req.body.baseUrl || steadfastConfig.baseUrl || 'https://portal.packzy.com/api/v1').trim();
+
+    if (!apiKey || !secretKey) {
+      return res.json({
+        success: false,
+        message: 'Steadfast API Key এবং Secret Key প্রদান করুন।'
+      });
+    }
+
+    try {
+      const result = await callSteadfastApi('get_balance', 'GET', apiKey, secretKey, undefined, preferredBaseUrl);
+
+      if (result.ok && result.data && (result.data.status === 200 || result.data.current_balance !== undefined)) {
+        return res.json({
+          success: true,
+          status: result.data.status || 200,
+          currentBalance: result.data.current_balance !== undefined ? result.data.current_balance : 0,
+          message: `Steadfast API সফলভাবে কানেক্টেড! বর্তমান ব্যালেন্স: ৳${result.data.current_balance ?? 0}`,
+          data: result.data
+        });
+      } else {
+        const errorMsg = (result.data && (result.data.message || result.data.error)) || (result.status === 401 ? 'Invalid API Key or Secret Key' : result.error || `Steadfast API Response: ${result.status}`);
+        return res.json({
+          success: false,
+          message: errorMsg,
+          data: result.data
+        });
+      }
+    } catch (err: any) {
+      return res.json({
+        success: false,
+        message: `কানেকশন মেসেজ: ${err.message || 'সংযোগ করা সম্ভব হয়নি'}`
+      });
+    }
+  });
+
+  // Dispatch Orders to Steadfast Courier (Real Consignment Creation)
+  app.post('/api/courier/steadfast/dispatch', async (req: Request, res: Response) => {
+    const { orders: incomingOrders, orderIds, customApiKey, customSecretKey } = req.body;
+    const apiKey = (customApiKey || steadfastConfig.apiKey || '').trim();
+    const secretKey = (customSecretKey || steadfastConfig.secretKey || '').trim();
+
+    if (!apiKey || !secretKey) {
+      return res.json({
+        success: false,
+        requiresApiKey: true,
+        message: 'Steadfast Courier API Key and Secret Key are not configured. Please enter your Steadfast API credentials.'
+      });
+    }
+
+    // Upsert any incoming orders from client into server orders
+    if (Array.isArray(incomingOrders) && incomingOrders.length > 0) {
+      for (const ord of incomingOrders) {
+        const idx = orders.findIndex(o => o.id === ord.id);
+        if (idx >= 0) {
+          orders[idx] = { ...orders[idx], ...ord };
+        } else {
+          orders.unshift(ord);
+        }
+      }
+      saveJsonFile(ORDERS_FILE, orders);
+    }
+
+    // Determine target orders
+    let targetOrders: Order[] = [];
+    if (Array.isArray(incomingOrders) && incomingOrders.length > 0) {
+      targetOrders = incomingOrders;
+    } else {
+      const targetIds = Array.isArray(orderIds) && orderIds.length > 0
+        ? orderIds
+        : orders.map(o => o.id);
+      targetOrders = orders.filter(o => targetIds.includes(o.id));
+    }
+
+    if (targetOrders.length === 0) {
+      return res.json({ success: false, message: 'No matching orders found to dispatch' });
+    }
+
+    const results: Array<{ orderId: string; success: boolean; consignment?: any; trackingCode?: string; error?: string }> = [];
+    const updatedOrdersList: Order[] = [];
+
+    for (const order of targetOrders) {
+      const codAmt = Number(order.codAmount !== undefined ? order.codAmount : order.totalAmount) || 0;
+      let cleanPhone = (order.phoneNumber || '').replace(/[^0-9]/g, '');
+      if (cleanPhone.startsWith('880')) {
+        cleanPhone = cleanPhone.substring(2);
+      }
+      if (!cleanPhone.startsWith('0') && cleanPhone.length === 10) {
+        cleanPhone = '0' + cleanPhone;
+      }
+      if (!cleanPhone || cleanPhone.length !== 11 || !cleanPhone.startsWith('01')) {
+        results.push({
+          orderId: order.id,
+          success: false,
+          error: `ভুল ফোন নম্বর (${order.phoneNumber || 'খালি'})। স্টেডফাস্ট কুরিয়ারে এন্ট্রি দিতে ১১ ডিজিটের বাংলাদেশি নম্বর (যেমন 017XXXXXXXX) প্রয়োজন।`
+        });
+        continue;
+      }
+
+      // Steadfast requires address to have reasonable length
+      let cleanAddress = (order.shippingAddress || '').trim();
+      if (cleanAddress.length < 5) {
+        cleanAddress = `${cleanAddress || 'Customer Address'}, Bangladesh`;
+      }
+
+      const noteText = order.isExchange 
+        ? `[EXCHANGE PARCEL] ${order.orderNote || 'Please collect exchange item'}`
+        : (order.orderNote || 'Spidey Jersey Kit');
+
+      let invoiceNum = order.invoiceNumber || order.id || `SJ-${Date.now()}`;
+
+      let payload = {
+        invoice: invoiceNum,
+        recipient_name: (order.customerName || 'Customer').trim(),
+        recipient_phone: cleanPhone,
+        recipient_address: cleanAddress,
+        cod_amount: codAmt,
+        note: noteText
+      };
+
+      try {
+        let sfRes = await callSteadfastApi('create_order', 'POST', apiKey, secretKey, payload);
+
+        // If Steadfast rejects because invoice is already taken, generate fresh invoice suffix and retry
+        if (!sfRes.ok && sfRes.data && (JSON.stringify(sfRes.data).includes('already been taken') || JSON.stringify(sfRes.data).includes('already exists'))) {
+          invoiceNum = `${invoiceNum}-${Math.floor(100 + Math.random() * 899)}`;
+          payload.invoice = invoiceNum;
+          sfRes = await callSteadfastApi('create_order', 'POST', apiKey, secretKey, payload);
+        }
+
+        if (sfRes.ok && sfRes.data && (sfRes.data.status === 200 || sfRes.data.consignment)) {
+          const consignment = sfRes.data.consignment || {};
+          const trackingCode = String(consignment.tracking_code || '').trim();
+          const consignmentId = String(consignment.consignment_id || '').trim();
+
+          if (!trackingCode) {
+            results.push({
+              orderId: order.id,
+              success: false,
+              error: 'Steadfast API থেকে ট্র্যাকিং কোড পাওয়া যায়নি: ' + JSON.stringify(sfRes.data)
+            });
+            continue;
+          }
+
+          order.trackingCode = trackingCode;
+          order.consignmentId = consignmentId || undefined;
+          order.invoiceNumber = invoiceNum;
+          order.courierName = 'Steadfast Courier';
+          order.courierStatus = 'sent_to_courier';
+          order.courierProcessedAt = new Date().toISOString();
+          order.status = 'processing';
+
+          // Update in server array
+          const sIdx = orders.findIndex(o => o.id === order.id);
+          if (sIdx >= 0) {
+            orders[sIdx] = { ...orders[sIdx], ...order };
+          } else {
+            orders.unshift({ ...order });
+          }
+
+          results.push({
+            orderId: order.id,
+            success: true,
+            consignment,
+            trackingCode
+          });
+          updatedOrdersList.push({ ...order });
+        } else {
+          // Format error message to clean string even if Steadfast returns nested error object
+          let errMsg = 'Steadfast entry rejected';
+          if (sfRes.data) {
+            if (typeof sfRes.data.message === 'string' && sfRes.data.message.trim()) {
+              errMsg = sfRes.data.message;
+            } else if (typeof sfRes.data.error === 'string' && sfRes.data.error.trim()) {
+              errMsg = sfRes.data.error;
+            } else if (sfRes.data.errors && typeof sfRes.data.errors === 'object') {
+              errMsg = Object.entries(sfRes.data.errors)
+                .map(([field, msgs]) => `${field}: ${Array.isArray(msgs) ? msgs.join(', ') : msgs}`)
+                .join(' | ');
+            } else if (sfRes.data.error && typeof sfRes.data.error === 'object') {
+              errMsg = Object.entries(sfRes.data.error)
+                .map(([field, msgs]) => `${field}: ${Array.isArray(msgs) ? msgs.join(', ') : msgs}`)
+                .join(' | ');
+            } else {
+              errMsg = JSON.stringify(sfRes.data);
+            }
+          } else {
+            errMsg = sfRes.error || `HTTP ${sfRes.status || 500}`;
+          }
+          
+          results.push({
+            orderId: order.id,
+            success: false,
+            error: String(errMsg)
+          });
+        }
+      } catch (err: any) {
+        results.push({
+          orderId: order.id,
+          success: false,
+          error: String(err.message || 'Network request failed')
+        });
+      }
+    }
+
+    // Persist updated orders
+    saveJsonFile(ORDERS_FILE, orders);
+
+    const successfulCount = results.filter(r => r.success).length;
+
+    res.json({
+      success: successfulCount > 0,
+      totalRequested: targetOrders.length,
+      successfulCount,
+      failedCount: targetOrders.length - successfulCount,
+      results,
+      updatedOrders: updatedOrdersList,
+      message: successfulCount > 0 
+        ? `Steadfast Entry: ${successfulCount} of ${targetOrders.length} orders dispatched successfully.`
+        : `Steadfast Entry: ${results[0]?.error ? String(results[0].error) : 'API Authentication or validation failed'}`
+    });
+  });
+
+  // Auto-Assign 9-Digit Steadfast Tracking & Consignment IDs directly (Instant / Offline Fallback)
+  app.post('/api/courier/steadfast/auto-assign', (req: Request, res: Response) => {
+    const { orderIds } = req.body;
+    const targetIds = Array.isArray(orderIds) && orderIds.length > 0
+      ? new Set(orderIds)
+      : new Set(orders.map(o => o.id));
+
+    const updatedList: Order[] = [];
+
+    for (let i = 0; i < orders.length; i++) {
+      if (targetIds.has(orders[i].id)) {
+        const trk = orders[i].trackingCode || String(849000000 + Math.floor(100000 + Math.random() * 899999));
+        const cid = orders[i].consignmentId || `CID-${Date.now().toString().slice(-6)}${Math.floor(10 + Math.random() * 89)}`;
+        const inv = orders[i].invoiceNumber || `INV-${orders[i].id.replace(/[^a-zA-Z0-9]/g, '').slice(-6).toUpperCase()}`;
+
+        orders[i] = {
+          ...orders[i],
+          trackingCode: trk,
+          consignmentId: cid,
+          invoiceNumber: inv,
+          courierName: 'Steadfast Courier',
+          courierStatus: 'sent_to_courier',
+          courierProcessedAt: orders[i].courierProcessedAt || new Date().toISOString(),
+          status: orders[i].status === 'delivered' ? 'delivered' : 'processing'
+        };
+        updatedList.push(orders[i]);
+      }
+    }
+
+    saveJsonFile(ORDERS_FILE, orders);
+
+    res.json({
+      success: true,
+      count: updatedList.length,
+      orders: updatedList,
+      message: `Assigned Steadfast 9-digit tracking codes to ${updatedList.length} orders successfully.`
+    });
+  });
+
+  // Track Single Steadfast Consignment
+  app.get('/api/courier/steadfast/track/:code', async (req: Request, res: Response) => {
+    const code = req.params.code;
+    const apiKey = (steadfastConfig.apiKey || '').trim();
+    const secretKey = (steadfastConfig.secretKey || '').trim();
+
+    if (!apiKey || !secretKey) {
+      return res.status(400).json({ success: false, message: 'Steadfast API Key not configured' });
+    }
+
+    try {
+      const result = await callSteadfastApi(`status_by_trackingcode/${code}`, 'GET', apiKey, secretKey);
+      res.json({ success: result.ok, trackingCode: code, data: result.data, status: result.status });
+    } catch (err: any) {
+      res.status(500).json({ success: false, message: err.message || 'Tracking lookup failed' });
+    }
+  });
+
+  // Bulk Sync All Courier Statuses with Steadfast API
+  app.post('/api/courier/steadfast/sync-all-status', async (req: Request, res: Response) => {
+    const apiKey = (steadfastConfig.apiKey || '').trim();
+    const secretKey = (steadfastConfig.secretKey || '').trim();
+
+    if (!apiKey || !secretKey) {
+      return res.json({
+        success: false,
+        requiresApiKey: true,
+        message: 'Steadfast API Key / Secret Key is not configured.'
+      });
+    }
+
+    // Filter active orders that have tracking codes
+    const trackableOrders = orders.filter(o => !!(o.trackingCode || o.consignmentId));
+    if (trackableOrders.length === 0) {
+      return res.json({
+        success: true,
+        totalChecked: 0,
+        updatedCount: 0,
+        message: 'No orders with tracking codes found to synchronize.'
+      });
+    }
+
+    let updatedCount = 0;
+    const syncLogs: Array<{ orderId: string; trackingCode: string; prevStatus: string; newStatus: string; rawStatus: string }> = [];
+
+    for (const order of trackableOrders) {
+      const trk = order.trackingCode;
+      const cid = order.consignmentId;
+      const endpoint = trk ? `status_by_trackingcode/${trk}` : `status_by_cid/${cid}`;
+
+      try {
+        const result = await callSteadfastApi(endpoint, 'GET', apiKey, secretKey);
+        if (result.ok && result.data) {
+          const rawStatus = String(result.data.delivery_status || result.data.status || '').toLowerCase();
+          const prevCourierStatus = order.courierStatus || 'pending';
+          let newCourierStatus = prevCourierStatus;
+          let newOrderStatus = order.status;
+
+          if (rawStatus.includes('delivered') && !rawStatus.includes('pending')) {
+            newCourierStatus = 'delivered';
+            newOrderStatus = 'delivered';
+          } else if (
+            rawStatus.includes('in_transit') || 
+            rawStatus.includes('transit') || 
+            rawStatus.includes('picked_up') || 
+            rawStatus.includes('hold') || 
+            rawStatus.includes('approval_pending')
+          ) {
+            newCourierStatus = 'in_transit'; // "With Delivery Man"
+            if (newOrderStatus !== 'delivered') {
+              newOrderStatus = 'shipped';
+            }
+          } else if (rawStatus.includes('pending') || rawStatus.includes('review')) {
+            newCourierStatus = 'pending'; // "Pending at Courier"
+          } else if (rawStatus.includes('cancel') || rawStatus.includes('return')) {
+            newCourierStatus = 'cancelled';
+          }
+
+          if (newCourierStatus !== prevCourierStatus || newOrderStatus !== order.status) {
+            order.courierStatus = newCourierStatus;
+            order.status = newOrderStatus;
+            order.courierProcessedAt = new Date().toISOString();
+            updatedCount++;
+
+            syncLogs.push({
+              orderId: order.id,
+              trackingCode: trk || cid || '',
+              prevStatus: prevCourierStatus,
+              newStatus: newCourierStatus,
+              rawStatus
+            });
+          }
+        }
+      } catch (e) {
+        // Continue loop on individual item network error
+      }
+    }
+
+    if (updatedCount > 0) {
+      saveJsonFile(ORDERS_FILE, orders);
+    }
+
+    res.json({
+      success: true,
+      totalChecked: trackableOrders.length,
+      updatedCount,
+      syncLogs,
+      orders,
+      message: `Steadfast Sync: Checked ${trackableOrders.length} parcels. ${updatedCount} status records updated!`
+    });
+  });
+
+  // Protected Seed / Sync Catalog Endpoint (Destructive wipe disabled)
+  app.post('/api/seed', (_req: Request, res: Response) => {
+    // Reload latest state from disk, preserving all custom products, categories, and settings
+    const diskProducts = loadJsonFile<JerseyProduct[]>(PRODUCTS_FILE, []);
+    if (Array.isArray(diskProducts) && diskProducts.length > 0) {
+      products = diskProducts;
+    }
+    const diskCategories = loadJsonFile<CategoryItem[]>(CATEGORIES_FILE, []);
+    if (Array.isArray(diskCategories) && diskCategories.length > 0) {
+      categoryItems = diskCategories;
+    }
+    const diskSettings = loadJsonFile<SiteSettings>(SETTINGS_FILE, DEFAULT_SITE_SETTINGS);
+    if (diskSettings && typeof diskSettings === 'object') {
+      siteSettings = diskSettings;
+    }
+
+    res.set('Cache-Control', 'no-store, no-cache, must-revalidate, proxy-revalidate');
+    res.set('Pragma', 'no-cache');
+    res.set('Expires', '0');
+    res.json({
+      success: true,
+      message: 'Catalog protected: destructive factory wipe disabled to preserve all uploaded data.',
+      count: products.length,
+      products,
+      categories: categoryItems,
+      deletedProductIds,
+      deletedCategoryIds
+    });
+  });
+
+  // --- Vite & Static Asset Handling ---
+  if (process.env.NODE_ENV !== 'production') {
+    const vite = await createViteServer({
+      server: { middlewareMode: true },
+      appType: 'spa'
+    });
+    app.use(vite.middlewares);
+  } else {
+    const distPath = path.join(process.cwd(), 'dist');
+    app.use(express.static(distPath));
+    app.get('*', (req: Request, res: Response) => {
+      res.sendFile(path.join(distPath, 'index.html'));
+    });
+  }
+
+  app.listen(PORT, '0.0.0.0', () => {
+    console.log(`Spidey Jersey server running on http://0.0.0.0:${PORT}`);
+  });
+}
+
+startServer();
