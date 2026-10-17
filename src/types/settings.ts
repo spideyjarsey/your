@@ -74,7 +74,7 @@ export const DEFAULT_SITE_SETTINGS: SiteSettings = {
   heroSubtext: 'WITH THE TOUCH OF OUR FASHION DESIGNER AND THE EMPIRE WHO STRENGTHENS THE SOUL OF EVERY CONCEPT, COBRA THE COURAGE TO PLAY BEYOND LIMITS, THROUGH ASYMMETRIC CUTS, AND RETRO SILHOUETTES AND UNCONVENTIONAL DETAILS.',
   heroUrlText: 'WWW.SPIDEY.COM',
   heroTimestamps: '3.23 / 3.22 / 3.03 / 2.04',
-  heroBgImage: '/images/fragment_hero_banner_1787668127629.jpg',
+  heroBgImage: '',
   categoryHeading: 'Shop by Category',
   bestsellerHeading: 'Bestsellers',
   footerText: 'DIFFERENTIATE, DON’T COMPARE',

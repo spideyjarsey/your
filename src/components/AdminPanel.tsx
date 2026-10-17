@@ -1625,13 +1625,18 @@ export const AdminPanel: React.FC<AdminPanelProps> = ({
               
               {/* Banner Live Preview */}
               <div className="relative w-full rounded-3xl overflow-hidden bg-[#8b0000] border border-neutral-200 shadow-xl">
-                <div className="relative aspect-[21/9] sm:aspect-[2.6/1] w-full overflow-hidden">
-                  <img
-                    src={localSettings.heroBgImage || '/images/fragment_hero_banner_1787668127629.jpg'}
-                    alt="Hero Banner Preview"
-                    referrerPolicy="no-referrer"
-                    className="w-full h-full object-cover object-center"
-                  />
+                  {localSettings.heroBgImage ? (
+                    <img
+                      src={localSettings.heroBgImage}
+                      alt="Hero Banner Preview"
+                      referrerPolicy="no-referrer"
+                      className="w-full h-full object-cover object-center"
+                    />
+                  ) : (
+                    <div className="w-full h-full bg-gradient-to-br from-neutral-950 via-[#8b0000] to-neutral-950 flex items-center justify-center">
+                      <span className="text-xs font-mono uppercase tracking-widest text-neutral-400">No Custom Banner Uploaded</span>
+                    </div>
+                  )}
                   <div className="absolute inset-0 bg-gradient-to-t from-black/85 via-black/40 to-black/40 pointer-events-none" />
 
                   <div className="absolute inset-0 flex items-center justify-center pointer-events-none select-none">
@@ -1661,7 +1666,6 @@ export const AdminPanel: React.FC<AdminPanelProps> = ({
                     </p>
                   </div>
                 </div>
-              </div>
 
               {/* Banner Editing Form */}
               <form onSubmit={handleSaveAllSettings} className="p-6 rounded-3xl bg-[#f8f9fa] border border-neutral-200/80 space-y-4">
@@ -1675,6 +1679,7 @@ export const AdminPanel: React.FC<AdminPanelProps> = ({
                         type="text"
                         value={localSettings.heroBgImage}
                         onChange={(e) => setLocalSettings({ ...localSettings, heroBgImage: e.target.value })}
+                        placeholder="Banner image URL or upload directly..."
                         className="flex-1 px-3 py-2 text-xs bg-white border border-neutral-200 rounded-xl text-neutral-900 focus:outline-none font-mono"
                       />
                       <input
@@ -1687,11 +1692,30 @@ export const AdminPanel: React.FC<AdminPanelProps> = ({
                       <button
                         type="button"
                         onClick={() => bannerFileInputRef.current?.click()}
-                        className="px-3 py-2 rounded-xl bg-neutral-900 hover:bg-neutral-800 text-xs font-semibold text-white flex items-center gap-1 shrink-0"
+                        className="px-3 py-2 rounded-xl bg-neutral-900 hover:bg-neutral-800 text-xs font-semibold text-white flex items-center gap-1 shrink-0 cursor-pointer"
                       >
                         <Upload className="w-3.5 h-3.5" />
                         <span>Upload R2</span>
                       </button>
+                      {localSettings.heroBgImage && (
+                        <button
+                          type="button"
+                          onClick={() => {
+                            setLocalSettings((prev) => {
+                              const next = { ...prev, heroBgImage: '' };
+                              onUpdateSiteSettings(next);
+                              return next;
+                            });
+                            setSyncStatusNote('✓ ব্যানার সফলভাবে ডিলিট করা হয়েছে');
+                            setTimeout(() => setSyncStatusNote(null), 3500);
+                          }}
+                          className="px-3 py-2 rounded-xl bg-rose-50 hover:bg-rose-100 text-xs font-semibold text-rose-600 border border-rose-200 flex items-center gap-1 shrink-0 transition-colors cursor-pointer"
+                          title="Delete current banner image"
+                        >
+                          <Trash2 className="w-3.5 h-3.5" />
+                          <span>Delete</span>
+                        </button>
+                      )}
                     </div>
                   </div>
 
@@ -1835,16 +1859,9 @@ export const AdminPanel: React.FC<AdminPanelProps> = ({
                           className="w-full h-full object-contain rounded-lg"
                         />
                       ) : (
-                        <svg 
-                          viewBox="0 0 24 24" 
-                          className="w-9 h-9 text-neutral-900" 
-                          fill="currentColor"
-                        >
-                          <path d="M12 2C7.58 2 4 5.58 4 10c0 2.21.9 4.21 2.35 5.66L6 20h3l1-2h4l1 2h3l-.35-4.34C19.1 14.21 20 12.21 20 10c0-4.42-3.58-8-8-8zm-3 9a1.5 1.5 0 1 1 0-3 1.5 1.5 0 0 1 0 3zm6 0a1.5 1.5 0 1 1 0-3 1.5 1.5 0 0 1 0 3zm-3 5c-1.1 0-2-.4-2-1h4c0 .6-.9 1-2 1z" />
-                          <circle cx="8" cy="18" r="1" />
-                          <circle cx="16" cy="18" r="1" />
-                          <path d="M7 21h10v1H7z" />
-                        </svg>
+                        <span className="text-[10px] font-bold text-neutral-400 uppercase text-center">
+                          Text Logo
+                        </span>
                       )}
                     </div>
 
@@ -1868,7 +1885,7 @@ export const AdminPanel: React.FC<AdminPanelProps> = ({
                           type="button"
                           disabled={isUploading}
                           onClick={() => headerLogoFileInputRef.current?.click()}
-                          className="px-3.5 py-2 rounded-xl bg-neutral-900 hover:bg-neutral-800 text-xs font-bold text-white flex items-center gap-1.5 shrink-0 shadow-sm transition-all"
+                          className="px-3.5 py-2 rounded-xl bg-neutral-900 hover:bg-neutral-800 text-xs font-bold text-white flex items-center gap-1.5 shrink-0 shadow-sm transition-all cursor-pointer"
                         >
                           <Upload className="w-3.5 h-3.5" />
                           <span>{isUploading ? 'Uploading...' : 'Upload Logo'}</span>
@@ -1877,13 +1894,17 @@ export const AdminPanel: React.FC<AdminPanelProps> = ({
                           <button
                             type="button"
                             onClick={() => {
-                              setLocalSettings({ ...localSettings, headerLogoImage: '' });
-                              onUpdateSiteSettings({ headerLogoImage: '' });
+                              setLocalSettings((prev) => {
+                                const next = { ...prev, headerLogoImage: '' };
+                                onUpdateSiteSettings(next);
+                                return next;
+                              });
                             }}
-                            className="px-3 py-2 rounded-xl bg-neutral-200 hover:bg-neutral-300 text-xs font-bold text-neutral-800 shrink-0 transition-all"
-                            title="Reset to default icon"
+                            className="px-3 py-2 rounded-xl bg-rose-50 hover:bg-rose-100 text-xs font-semibold text-rose-600 border border-rose-200 flex items-center gap-1 shrink-0 transition-colors cursor-pointer"
+                            title="Delete current logo image"
                           >
-                            Reset
+                            <Trash2 className="w-3.5 h-3.5" />
+                            <span>Delete</span>
                           </button>
                         )}
                       </div>

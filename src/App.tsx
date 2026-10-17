@@ -268,21 +268,14 @@ export default function App() {
 
   const [isAuthModalOpen, setIsAuthModalOpen] = useState<boolean>(false);
 
-  // Product Data with LocalStorage Persistence and Deleted Tombstones
+  // Product Data with LocalStorage Persistence
   const [products, setProducts] = useState<JerseyProduct[]>(() => {
     try {
-      const deletedRaw = localStorage.getItem('spidey_deleted_product_ids');
-      const deletedIds: string[] = deletedRaw ? JSON.parse(deletedRaw) : [];
-      const delSet = new Set(deletedIds.filter(id => Boolean(id && String(id).trim())));
-
       const saved = localStorage.getItem('spidey_products');
       if (saved) {
         const parsed = JSON.parse(saved);
         if (Array.isArray(parsed) && parsed.length > 0) {
-          const valid = parsed.filter((p: any) => !(p.id && delSet.has(p.id)) && !(p.code && delSet.has(p.code)));
-          if (valid.length > 0) {
-            return sortProductsWithPinned(valid);
-          }
+          return sortProductsWithPinned(parsed);
         }
       }
       return [];
@@ -512,32 +505,13 @@ export default function App() {
       });
       if (res.ok) {
         const data = await res.json();
-        if (data.products && Array.isArray(data.products) && data.products.length > 0) {
-          // Sync server-side deleted tombstones with localStorage
-          let delSet = new Set<string>();
-          try {
-            const currentDeleted: string[] = JSON.parse(localStorage.getItem('spidey_deleted_product_ids') || '[]');
-            const serverDeleted: string[] = Array.isArray(data.deletedProductIds) ? data.deletedProductIds : [];
-            const merged = Array.from(new Set([...currentDeleted, ...serverDeleted])).filter(id => Boolean(id && String(id).trim()));
-            localStorage.setItem('spidey_deleted_product_ids', JSON.stringify(merged));
-            delSet = new Set(merged);
-          } catch {}
-
-          // Filter against tombstone set and sort strictly: Pinned items float to Top, then drag-and-drop sortOrder
-          const validProducts = data.products.filter((p: JerseyProduct) => !(p.id && delSet.has(p.id)) && !(p.code && delSet.has(p.code)));
-          const cleanProducts: JerseyProduct[] = sortProductsWithPinned(
-            validProducts.length > 0 ? validProducts : data.products
-          );
-
+        if (data.products && Array.isArray(data.products)) {
+          const cleanProducts: JerseyProduct[] = sortProductsWithPinned(data.products);
           setProducts(cleanProducts);
           try {
             localStorage.setItem('spidey_products', JSON.stringify(cleanProducts));
+            localStorage.removeItem('spidey_deleted_product_ids');
             localStorage.removeItem('orifake_products');
-          } catch {}
-        } else {
-          setProducts([]);
-          try {
-            localStorage.setItem('spidey_products', JSON.stringify([]));
           } catch {}
         }
       }
@@ -719,45 +693,64 @@ export default function App() {
     try {
       const res = await fetch('/api/products', {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
+        headers: { 'Content-Type': 'application/json', 'Cache-Control': 'no-cache' },
         body: JSON.stringify(productData)
       });
       const data = await res.json();
       if (data.success && data.product) {
-        setProducts((prev) => [data.product, ...prev]);
-        showToast('New drop published!');
+        setProducts((prev) => {
+          const next = [data.product, ...prev.filter((p) => p.id !== data.product.id)];
+          try {
+            localStorage.setItem('spidey_products', JSON.stringify(next));
+          } catch {}
+          return next;
+        });
+        showToast('নতুন প্রোডাক্ট সফলভাবে যুক্ত হয়েছে!');
         fetchStats();
         return true;
       }
     } catch (err) {
-      console.error(err);
+      console.error('Product add error:', err);
     }
     return false;
   };
 
   const handleBulkAddProducts = (newProducts: JerseyProduct[]) => {
     if (!Array.isArray(newProducts) || newProducts.length === 0) return;
-    setProducts((prev) => [...newProducts, ...prev]);
+    setProducts((prev) => {
+      const newIds = new Set(newProducts.map((p) => p.id));
+      const next = [...newProducts, ...prev.filter((p) => !newIds.has(p.id))];
+      try {
+        localStorage.setItem('spidey_products', JSON.stringify(next));
+      } catch {}
+      return next;
+    });
     showToast(`Successfully imported ${newProducts.length} products!`);
     fetchStats();
   };
 
   const handleUpdateProduct = async (id: string, updateData: Partial<JerseyProduct>): Promise<boolean> => {
     try {
-      const res = await fetch(`/api/products/${id}`, {
+      const res = await fetch(`/api/products/${encodeURIComponent(id)}`, {
         method: 'PUT',
-        headers: { 'Content-Type': 'application/json' },
+        headers: { 'Content-Type': 'application/json', 'Cache-Control': 'no-cache' },
         body: JSON.stringify(updateData)
       });
       const data = await res.json();
       if (data.success && data.product) {
-        setProducts((prev) => prev.map((p) => (p.id === id ? data.product : p)));
-        showToast('Product updated!');
+        setProducts((prev) => {
+          const next = prev.map((p) => (p.id === id || (p.code && p.code === id) ? data.product : p));
+          try {
+            localStorage.setItem('spidey_products', JSON.stringify(next));
+          } catch {}
+          return next;
+        });
+        showToast('প্রোডাক্ট সফলভাবে আপডেট হয়েছে!');
         fetchStats();
         return true;
       }
     } catch (err) {
-      console.error(err);
+      console.error('Product update error:', err);
     }
     return false;
   };

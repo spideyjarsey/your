@@ -1,1 +1,72 @@
-[]
+[
+  {
+    "id": "spidey-1792109641944-an08",
+    "code": "SJ-9LGE5",
+    "title": "Product A",
+    "category": "Jersey",
+    "price": 600,
+    "season": "2024/25",
+    "edition": "Player Issue / Authentic",
+    "images": [],
+    "description": "",
+    "features": [],
+    "sizes": [
+      "S",
+      "M",
+      "L",
+      "XL",
+      "XXL",
+      "3XL"
+    ],
+    "inStock": true,
+    "stockCount": 15,
+    "rating": 5,
+    "reviewCount": 0,
+    "customizable": true,
+    "colorTheme": {
+      "primary": "#111827",
+      "accent": "#06b6d4",
+      "glow": "rgba(6, 182, 212, 0.35)"
+    },
+    "sortOrder": 1,
+    "position": 1,
+    "priority": 1,
+    "createdAt": "2026-10-16T00:14:01.944Z",
+    "updatedAt": "2026-10-16T00:14:01.944Z"
+  },
+  {
+    "id": "spidey-1792109124858-fyym",
+    "code": "SJ-JBDB4",
+    "title": "Test Item 1",
+    "category": "Jersey",
+    "price": 500,
+    "season": "2024/25",
+    "edition": "Player Issue / Authentic",
+    "images": [],
+    "description": "",
+    "features": [],
+    "sizes": [
+      "S",
+      "M",
+      "L",
+      "XL",
+      "XXL",
+      "3XL"
+    ],
+    "inStock": true,
+    "stockCount": 14,
+    "rating": 5,
+    "reviewCount": 0,
+    "customizable": true,
+    "colorTheme": {
+      "primary": "#111827",
+      "accent": "#06b6d4",
+      "glow": "rgba(6, 182, 212, 0.35)"
+    },
+    "sortOrder": 2,
+    "position": 2,
+    "priority": 2,
+    "createdAt": "2026-10-16T00:05:24.858Z",
+    "updatedAt": "2026-10-16T00:05:24.858Z"
+  }
+]

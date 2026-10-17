@@ -1,6 +1,6 @@
 import { JerseyProduct } from '../types';
 
-export const heroBannerImg = '/images/fragment_hero_banner_1787668127629.jpg';
+export const heroBannerImg = '';
 
 export interface CategoryCardData {
   id: string;

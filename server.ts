@@ -35,34 +35,26 @@ const IMAGES_FILE = path.join(DATA_DIR, 'images.json');
 
 // Helper to safely load JSON with backup recovery to prevent data loss across deployments
 function loadJsonFile<T>(filePath: string, defaultValue: T): T {
-  const backupPath = `${filePath}.bak`;
   try {
     if (fs.existsSync(filePath)) {
       const data = fs.readFileSync(filePath, 'utf-8');
       if (data && data.trim()) {
         const parsed = JSON.parse(data);
-        // If parsed is empty array but defaultValue has items, prioritize backup
-        if (Array.isArray(parsed) && parsed.length === 0 && Array.isArray(defaultValue) && defaultValue.length > 0) {
-          console.warn(`File ${filePath} is an empty array, attempting backup recovery...`);
-        } else {
-          return parsed;
-        }
+        return parsed as T;
       }
     }
   } catch (e) {
-    console.warn(`Error reading ${filePath}, attempting backup recovery:`, e);
+    console.warn(`Error reading ${filePath}:`, e);
   }
 
   // Backup recovery fallback
+  const backupPath = `${filePath}.bak`;
   try {
     if (fs.existsSync(backupPath)) {
       const backupData = fs.readFileSync(backupPath, 'utf-8');
       if (backupData && backupData.trim()) {
         const parsed = JSON.parse(backupData);
-        if (Array.isArray(parsed) && parsed.length > 0) {
-          console.log(`✓ Recovered non-empty data for ${path.basename(filePath)} from backup file`);
-          return parsed as T;
-        }
+        return parsed as T;
       }
     }
   } catch (backupErr) {
@@ -72,33 +64,21 @@ function loadJsonFile<T>(filePath: string, defaultValue: T): T {
   return defaultValue;
 }
 
-// Helper to atomically save JSON with automatic backup rotation
+// Helper to reliably save JSON with synchronous backup copy
 function saveJsonFile(filePath: string, data: any) {
   const backupPath = `${filePath}.bak`;
-  const tempPath = `${filePath}.tmp.${Date.now()}`;
   try {
     const jsonString = JSON.stringify(data, null, 2);
-    // 1. Write to temp file first
-    fs.writeFileSync(tempPath, jsonString, 'utf-8');
-    // 2. Rotate current file to backup ONLY if it has content
-    if (fs.existsSync(filePath)) {
-      try {
-        const stat = fs.statSync(filePath);
-        if (stat.size > 0) {
-          fs.copyFileSync(filePath, backupPath);
-        }
-      } catch {}
+    const dir = path.dirname(filePath);
+    if (!fs.existsSync(dir)) {
+      fs.mkdirSync(dir, { recursive: true });
     }
-    // 3. Atomically replace target file
-    fs.renameSync(tempPath, filePath);
-  } catch (e) {
-    console.warn(`Atomic save failed for ${filePath}, falling back to direct write:`, e);
+    fs.writeFileSync(filePath, jsonString, 'utf-8');
     try {
-      if (fs.existsSync(tempPath)) fs.unlinkSync(tempPath);
-      fs.writeFileSync(filePath, JSON.stringify(data, null, 2), 'utf-8');
-    } catch (writeErr) {
-      console.error(`Fatal: Could not save ${filePath}:`, writeErr);
-    }
+      fs.writeFileSync(backupPath, jsonString, 'utf-8');
+    } catch {}
+  } catch (e) {
+    console.error(`Fatal: Could not save ${filePath}:`, e);
   }
 }
 
@@ -115,16 +95,6 @@ interface StoredImage {
 let deletedProductIds: string[] = loadJsonFile<string[]>(DELETED_PRODUCTS_FILE, []);
 let products: JerseyProduct[] = loadJsonFile<JerseyProduct[]>(PRODUCTS_FILE, []);
 
-// Purge any products that were permanently deleted
-if (deletedProductIds.length > 0) {
-  const delSet = new Set(deletedProductIds);
-  const beforeLen = products.length;
-  products = products.filter((p) => !delSet.has(p.id) && !delSet.has(p.code));
-  if (products.length !== beforeLen) {
-    saveJsonFile(PRODUCTS_FILE, products);
-  }
-}
-
 // Ensure every product has sortOrder and position stamped
 products.forEach((p, idx) => {
   if (p.sortOrder === undefined) p.sortOrder = idx;
@@ -137,14 +107,6 @@ let siteSettings: SiteSettings = loadJsonFile<SiteSettings>(SETTINGS_FILE, { ...
 let categoryItems: CategoryItem[] = loadJsonFile<CategoryItem[]>(CATEGORIES_FILE, []);
 
 let deletedCategoryIds: string[] = loadJsonFile<string[]>(DELETED_CATEGORIES_FILE, []);
-if (deletedCategoryIds.length > 0) {
-  const delSet = new Set(deletedCategoryIds);
-  const beforeLen = categoryItems.length;
-  categoryItems = categoryItems.filter((c) => !delSet.has(c.id) && !delSet.has(c.name));
-  if (categoryItems.length !== beforeLen) {
-    saveJsonFile(CATEGORIES_FILE, categoryItems);
-  }
-}
 
 // Ensure every category has sortOrder and position stamped
 categoryItems.forEach((c, idx) => {
@@ -884,13 +846,7 @@ async function startServer() {
       });
     }
 
-    // Ensure deleted products are never returned
-    if (deletedProductIds.length > 0) {
-      const delSet = new Set(deletedProductIds);
-      list = list.filter((p) => !delSet.has(p.id) && !delSet.has(p.code));
-    }
-
-    res.json({ success: true, count: list.length, products: list, deletedProductIds });
+    res.json({ success: true, count: list.length, products: list });
   });
 
   // Get Single Product
@@ -898,7 +854,8 @@ async function startServer() {
     res.set('Cache-Control', 'no-store, no-cache, must-revalidate, proxy-revalidate');
     res.set('Pragma', 'no-cache');
     res.set('Expires', '0');
-    const product = products.find((p) => p.id === req.params.id);
+    const targetId = decodeURIComponent(String(req.params.id || '').trim());
+    const product = products.find((p) => p.id === targetId || (p.code && p.code === targetId));
     if (!product) {
       return res.status(404).json({ success: false, message: 'Product not found' });
     }
@@ -920,7 +877,9 @@ async function startServer() {
       return res.status(400).json({ success: false, message: 'Title, category, and price are required' });
     }
 
-    const autoCode = data.code || `SJ-${Math.random().toString(36).substring(2, 7).toUpperCase()}`;
+    const autoCode = (data.code && String(data.code).trim())
+      ? String(data.code).trim()
+      : `SJ-${Math.random().toString(36).substring(2, 7).toUpperCase()}`;
 
     const sanitizedImages = (Array.isArray(data.images) ? data.images : [])
       .map((img: any) => {
@@ -934,8 +893,8 @@ async function startServer() {
     const newProduct: JerseyProduct = {
       id: `spidey-${Date.now()}-${Math.random().toString(36).substring(2, 6)}`,
       code: autoCode,
-      title: data.title,
-      category: data.category,
+      title: String(data.title).trim(),
+      category: String(data.category).trim(),
       price: Number(data.price),
       originalPrice: data.originalPrice ? Number(data.originalPrice) : undefined,
       season: data.season || '2024/25',
@@ -970,14 +929,12 @@ async function startServer() {
       p.priority = idx;
     });
 
-    // If this id or code was previously deleted, remove it from tombstone
-    deletedProductIds = deletedProductIds.filter(id => id !== newProduct.id && id !== newProduct.code);
-    saveJsonFile(DELETED_PRODUCTS_FILE, deletedProductIds);
     saveJsonFile(PRODUCTS_FILE, products);
+
     res.set('Cache-Control', 'no-store, no-cache, must-revalidate, proxy-revalidate');
     res.set('Pragma', 'no-cache');
     res.set('Expires', '0');
-    res.status(201).json({ success: true, product: newProduct });
+    res.status(201).json({ success: true, product: newProduct, products });
   });
 
   // Reorder Products endpoint (Admin drag-and-drop sync)
@@ -1071,7 +1028,9 @@ async function startServer() {
       ...current,
       ...updateData,
       id: current.id,
-      code: updateData.code !== undefined ? updateData.code : current.code,
+      code: updateData.code !== undefined ? String(updateData.code).trim() : current.code,
+      title: updateData.title !== undefined ? String(updateData.title).trim() : current.title,
+      category: updateData.category !== undefined ? String(updateData.category).trim() : current.category,
       images: sanitizedImages,
       price: updateData.price !== undefined ? Number(updateData.price) : current.price,
       originalPrice: updateData.originalPrice !== undefined ? (updateData.originalPrice ? Number(updateData.originalPrice) : undefined) : current.originalPrice,
@@ -1081,43 +1040,54 @@ async function startServer() {
 
     products[index] = updated;
     saveJsonFile(PRODUCTS_FILE, products);
-    res.json({ success: true, product: updated });
+
+    res.set('Cache-Control', 'no-store, no-cache, must-revalidate, proxy-revalidate');
+    res.set('Pragma', 'no-cache');
+    res.set('Expires', '0');
+    res.json({ success: true, product: updated, products });
   });
 
   // Delete Product Permanently (Admin)
   app.delete('/api/products/:id', (req: Request, res: Response) => {
+    // 1. Reload latest products from disk first!
+    if (fs.existsSync(PRODUCTS_FILE)) {
+      const loaded = loadJsonFile<JerseyProduct[]>(PRODUCTS_FILE, []);
+      if (Array.isArray(loaded)) {
+        products = loaded;
+      }
+    }
+
     const targetId = decodeURIComponent(String(req.params.id || '').trim());
-    const index = products.findIndex((p) => p.id === targetId || p.code === targetId);
-    
+    if (!targetId) {
+      return res.status(400).json({ success: false, message: 'Product ID is required' });
+    }
+
+    // Delete ONLY the exact matching product by ID (or code if matching)
+    const index = products.findIndex((p) => p.id === targetId || (p.code && p.code === targetId));
     let deleted: JerseyProduct | null = null;
     if (index !== -1) {
       deleted = products.splice(index, 1)[0];
     }
 
-    // Always tombstone the targetId so it never resurrects
-    if (targetId && !deletedProductIds.includes(targetId)) {
-      deletedProductIds.push(targetId);
-    }
-    if (deleted) {
-      if (deleted.id && !deletedProductIds.includes(deleted.id)) {
-        deletedProductIds.push(deleted.id);
-      }
-      if (deleted.code && !deletedProductIds.includes(deleted.code)) {
-        deletedProductIds.push(deleted.code);
-      }
-    }
-
-    saveJsonFile(DELETED_PRODUCTS_FILE, deletedProductIds);
+    // Save updated products directly to disk
     saveJsonFile(PRODUCTS_FILE, products);
 
-    // Return the clean live product catalog directly
-    const cleanProducts = products.filter(p => !deletedProductIds.includes(p.id) && !deletedProductIds.includes(p.code));
+    // Keep deletedProductIds in sync
+    deletedProductIds = deletedProductIds.filter(id => id !== targetId);
+    if (deleted?.code) {
+      deletedProductIds = deletedProductIds.filter(id => id !== deleted.code);
+    }
+    saveJsonFile(DELETED_PRODUCTS_FILE, deletedProductIds);
+
+    res.set('Cache-Control', 'no-store, no-cache, must-revalidate, proxy-revalidate');
+    res.set('Pragma', 'no-cache');
+    res.set('Expires', '0');
+
     res.json({
       success: true,
       message: 'Product permanently deleted',
       product: deleted,
-      products: cleanProducts,
-      deletedProductIds
+      products
     });
   });
 
@@ -1968,15 +1938,26 @@ Amount: ${amountVal}৳`;
     return Array.from(candidates);
   }
 
-  async function sendTelegramOrderNotification(order: Order, settings: SiteSettings): Promise<{ success: boolean; message?: string; chatId?: string }> {
-    const token = (settings.telegramBotToken || '8972453715:AAEHlxk5XLQgsozL1yTwpuCAgT0RSHOzwIw').trim();
-    const rawChatId = (settings.telegramChatId || '-1003901747514').trim();
+  async function sendTelegramOrderNotification(order: Order, settings?: SiteSettings): Promise<{ success: boolean; message?: string; chatId?: string }> {
+    let effectiveSettings = settings || siteSettings;
+    if (fs.existsSync(SETTINGS_FILE)) {
+      try {
+        const loaded = loadJsonFile<SiteSettings>(SETTINGS_FILE, DEFAULT_SITE_SETTINGS);
+        if (loaded && typeof loaded === 'object') {
+          effectiveSettings = { ...DEFAULT_SITE_SETTINGS, ...loaded, ...(settings || {}) };
+          siteSettings = effectiveSettings;
+        }
+      } catch {}
+    }
 
-    if (!token || !rawChatId || settings.telegramNotificationsEnabled === false) {
+    const token = (effectiveSettings.telegramBotToken || '8972453715:AAEHlxk5XLQgsozL1yTwpuCAgT0RSHOzwIw').trim();
+    const rawChatId = (effectiveSettings.telegramChatId || '-1003901747514').trim();
+
+    if (!token || !rawChatId || effectiveSettings.telegramNotificationsEnabled === false) {
       return { success: false, message: 'Telegram notification is disabled or not configured.' };
     }
 
-    const text = formatTelegramOrderText(order, settings);
+    const text = formatTelegramOrderText(order, effectiveSettings);
     const candidateIds = normalizeTelegramChatIds(rawChatId);
 
     let lastError = '';
@@ -2007,7 +1988,7 @@ Amount: ${amountVal}৳`;
   }
 
   // Orders / Checkout Simulation
-  app.post('/api/orders', (req: Request, res: Response) => {
+  app.post('/api/orders', async (req: Request, res: Response) => {
     const { 
       items, 
       customerName, 
@@ -2106,14 +2087,21 @@ Amount: ${amountVal}৳`;
     }
     saveJsonFile(PRODUCTS_FILE, products);
 
-    // Asynchronously dispatch Telegram order notification to group
-    sendTelegramOrderNotification(newOrder, siteSettings).catch((err) => {
-      console.warn('Telegram notification async dispatch error:', err);
-    });
+    // Directly dispatch Telegram order notification to group and await delivery
+    let telegramResult: { success: boolean; message?: string; chatId?: string } = { success: false, message: '' };
+    try {
+      telegramResult = await sendTelegramOrderNotification(newOrder, siteSettings);
+      console.log(`✓ Telegram order dispatch result:`, telegramResult);
+    } catch (err: any) {
+      console.warn('Telegram notification dispatch error:', err);
+      telegramResult = { success: false, message: err?.message || 'Telegram network error' };
+    }
 
     res.status(201).json({
       success: true,
       order: newOrder,
+      telegramSent: telegramResult.success,
+      telegramError: telegramResult.success ? undefined : telegramResult.message,
       message: 'Order confirmed and notification sent directly to Telegram'
     });
   });
@@ -3062,7 +3050,14 @@ Amount: ${amountVal}৳`;
   // --- Vite & Static Asset Handling ---
   if (process.env.NODE_ENV !== 'production') {
     const vite = await createViteServer({
-      server: { middlewareMode: true },
+      server: {
+        middlewareMode: true,
+        allowedHosts: true,
+        hmr: false,
+        watch: {
+          ignored: ['**/store_data/**', '**/uploads/**', '**/*.json']
+        }
+      },
       appType: 'spa'
     });
     app.use(vite.middlewares);
